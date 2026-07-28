@@ -1,8 +1,8 @@
 """
 测试医疗机构等级系数测算和本地目录库分值测算（真实断言版）
 """
-import sys
-sys.path.insert(0, 'F:/DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
 from src.core.hospital_coefficient import HospitalCoefficientCalculator, HospitalLevelClassifier

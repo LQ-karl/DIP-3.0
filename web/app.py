@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from decimal import Decimal
 from src.models.models import MedicalRecord, GroupType
 from src.core.grouping_engine import DIPGroupingEngine
+from src.utils.paths import get_data_dir
 from src.core.value_calculator_selectable import (
     DIPValueCalculator, ValueCalculationConfig, ValueCalculationMethod,
     create_average_cost_config, create_reference_disease_config, create_standard_quota_config
@@ -250,7 +251,7 @@ def page_grouping():
                     from src.models.models import DiseaseGroup, GroupType
                     
                     # 加载DIP3.0目录库
-                    dip_dir = pd.read_excel("F:/DIP/data/DIP3.0国家目录库.xlsx")
+                    dip_dir = pd.read_excel(str(get_data_dir() / "DIP3.0国家目录库.xlsx"))
                     
                     def find_dip_code_from_dir(diag_code, oprn_code):
                         """从DIP3.0目录库查找匹配的DIP编码"""
@@ -402,7 +403,7 @@ def page_results():
         
         # 加载DIP3.0目录库
         try:
-            dip_dir = pd.read_excel("F:/DIP/data/DIP3.0国家目录库.xlsx")
+            dip_dir = pd.read_excel(str(get_data_dir() / "DIP3.0国家目录库.xlsx"))
             dip_info_map = {}
             for _, row in dip_dir.iterrows():
                 dip_code = str(row.get('DIP编码', ''))
@@ -538,12 +539,12 @@ def page_dictionary():
     
     # 加载数据
     dict_file_map = {
-        "DIP3.0国家目录库": "F:/DIP/data/DIP3.0国家目录库.xlsx",
-        "低标目录": "F:/DIP/data/低标目录(1).xlsx",
-        "ICD-10编码": "F:/DIP/data/ICD10国临版2.0对照医保版2.0_0125.xlsx",
-        "ICD-9-CM-3编码": "F:/DIP/data/ICD9国临版3.0对照医保版2.0_0125.xlsx",
-        "CCI合并症并发症": "F:/DIP/data/CCI.xlsx",
-        "疾病严重程度辅助目录": "F:/DIP/data/中重度分型诊断.xlsx"
+        "DIP3.0国家目录库": str(get_data_dir() / "DIP3.0国家目录库.xlsx"),
+        "低标目录": str(get_data_dir() / "低标目录(1).xlsx"),
+        "ICD-10编码": str(get_data_dir() / "ICD10国临版2.0对照医保版2.0_0125.xlsx"),
+        "ICD-9-CM-3编码": str(get_data_dir() / "ICD9国临版3.0对照医保版2.0_0125.xlsx"),
+        "CCI合并症并发症": str(get_data_dir() / "CCI.xlsx"),
+        "疾病严重程度辅助目录": str(get_data_dir() / "中重度分型诊断.xlsx")
     }
     
     try:

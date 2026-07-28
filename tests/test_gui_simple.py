@@ -3,8 +3,8 @@ DIP测算工具 - 简单测试界面
 """
 import tkinter as tk
 from tkinter import ttk
-import sys
-sys.path.insert(0, 'F:/DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
 from src.core.calculation_config import (

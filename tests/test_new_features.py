@@ -6,10 +6,11 @@ DIP测算工具 - 新功能综合测试（真实断言版）
 3. 辅助目录分型表格
 4. 医疗机构等级系数选择
 """
-import sys
-sys.path.insert(0, 'F:/DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
+from src.utils.paths import get_output_dir
 from pathlib import Path
 from src.models.models import MedicalRecord, DiseaseGroup
 from src.interfaces.settlement_importer import SettlementDataImporter, ImportConfig
@@ -99,7 +100,7 @@ def test_local_directory_export():
         assert isinstance(rec.disease_value, Decimal)
         assert rec.disease_value >= 0, f"病种 {rec.dip_code} 的病种分值应非负"
 
-    output_path = "F:/DIP/output/test_local_directory_dip30.xlsx"
+    output_path = str(get_output_dir() / "test_local_directory_dip30.xlsx")
     exporter.export_to_excel(directory, output_path)
     assert Path(output_path).exists(), "DIP3.0 本地目录库未导出"
 
@@ -115,7 +116,7 @@ def test_auxiliary_directory_export():
         assert c.max_coefficient is not None and c.max_coefficient > 0, "最高调节系数应 > 0"
         assert c.cci_type is not None and c.severity_type is not None and c.age_type is not None
 
-    output_path = "F:/DIP/output/test_auxiliary_directory.xlsx"
+    output_path = str(get_output_dir() / "test_auxiliary_directory.xlsx")
     exporter.export_to_excel(classifications, output_path)
     assert Path(output_path).exists(), "辅助目录分型表未导出"
 
@@ -155,7 +156,7 @@ def test_hospital_coefficient_selection():
     # 综合系数结果可导出
     selector = HospitalCoefficientSelector(create_comprehensive_config())
     results = selector.batch_calculate(hospital_data_list, records)
-    output_path = "F:/DIP/output/test_hospital_coefficients.xlsx"
+    output_path = str(get_output_dir() / "test_hospital_coefficients.xlsx")
     selector.export_coefficients(results, output_path)
     assert Path(output_path).exists(), "医院系数结果未导出"
 

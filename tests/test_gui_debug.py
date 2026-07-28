@@ -5,8 +5,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import sys
 import traceback
+import os
 
-sys.path.insert(0, 'F:/DIP')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
 from src.core.calculation_config import (
@@ -20,7 +21,7 @@ from src.models.models import MedicalRecord, HospitalCoefficient
 
 
 # 日志文件
-LOG_FILE = "F:/DIP/gui_log.txt"
+LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gui_log.txt")
 
 def log(msg):
     """写日志"""

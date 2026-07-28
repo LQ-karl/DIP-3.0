@@ -1,8 +1,8 @@
 """
 DIP辅助目录测算 - 测试脚本（真实断言版）
 """
-import sys
-sys.path.insert(0, 'F:\\DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
 from src.models.models import MedicalRecord

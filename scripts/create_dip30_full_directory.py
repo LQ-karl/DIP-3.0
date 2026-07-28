@@ -1,5 +1,8 @@
 import pandas as pd
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.utils.paths import get_data_dir, get_templates_dir
 
 # 创建DIP3.0国家目录库（完整版示例）
 # 注意：这只是示例数据，完整数据需要从国家医保局获取
@@ -148,7 +151,7 @@ for group in all_groups:
 df = pd.DataFrame(template_data)
 
 # 创建目录
-output_dir = Path('F:/DIP/data')
+output_dir = get_data_dir()
 output_dir.mkdir(exist_ok=True)
 
 # 保存为Excel

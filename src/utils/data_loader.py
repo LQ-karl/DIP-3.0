@@ -8,19 +8,20 @@ from pathlib import Path
 import os
 
 from ..models.models import DiseaseGroup, GroupType
+from .paths import get_data_dir
 
 
 class DataLoader:
     """数据加载器"""
     
-    def __init__(self, data_dir: str = "F:\\DIP\\data"):
+    def __init__(self, data_dir: str = None):
         """
         初始化数据加载器
-        
+
         Args:
-            data_dir: 数据目录路径
+            data_dir: 数据目录路径（默认取项目 data 目录）
         """
-        self.data_dir = Path(data_dir)
+        self.data_dir = Path(data_dir) if data_dir else get_data_dir()
         self.loaded_data = {}
     
     def load_excel(self, filename: str, sheet_name: str = 0) -> pd.DataFrame:
@@ -283,8 +284,8 @@ class DataLoader:
 class DiseaseGroupLoader:
     """病种组合加载器"""
     
-    def __init__(self, data_dir: str = "F:\\DIP\\data"):
-        self.data_dir = Path(data_dir)
+    def __init__(self, data_dir: str = None):
+        self.data_dir = Path(data_dir) if data_dir else get_data_dir()
         self.data_loader = DataLoader(data_dir)
     
     def load_disease_groups_from_excel(self, filename: str) -> List[DiseaseGroup]:

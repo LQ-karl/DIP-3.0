@@ -1,8 +1,8 @@
 """
 测试可配置的测算参数功能（真实断言版）
 """
-import sys
-sys.path.insert(0, 'F:/DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
 from src.core.calculation_config import (

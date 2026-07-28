@@ -2,17 +2,18 @@
 DIP本地目录库生成 - 测试脚本（真实断言版）
 演示如何根据医保清单数据生成本地DIP目录库
 """
-import sys
-sys.path.insert(0, 'F:\\DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 from pathlib import Path
 
 from src import DIPGroupingTool, LocalDirectoryGenerator
+from src.utils.paths import get_output_dir
 
 
-SAMPLE_FILE = Path("F:\\DIP\\tests\\sample_settlement_data.xlsx")
-OUTPUT_DIR = Path("F:\\DIP\\output\\local_directory")
+SAMPLE_FILE = Path(__file__).resolve().parent / "sample_settlement_data.xlsx"
+OUTPUT_DIR = get_output_dir() / "local_directory"
 THRESHOLD = 10
 
 
@@ -126,7 +127,7 @@ def test_local_directory_generation():
     sample_file = create_sample_settlement_data()
     assert Path(sample_file).exists()
 
-    tool = DIPGroupingTool(data_dir="F:\\DIP\\data")
+    tool = DIPGroupingTool()
 
     # threshold 经 generate_local_directory 透传（验证 ③ 的修复）
     output_file = tool.generate_local_directory(

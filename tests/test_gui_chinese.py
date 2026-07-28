@@ -4,10 +4,11 @@ DIP测算工具 - 中文图形化测试界面（完整版）
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import sys
-sys.path.insert(0, 'F:/DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
+from src.utils.paths import get_data_dir
 from pathlib import Path
 from src.core.calculation_config import (
     DIPCalculationConfig, CostType, CostCalculationConfig, StatisticalConfig,
@@ -505,7 +506,7 @@ class DIPCalculationApp:
         dip_info_map = {}
         try:
             import pandas as pd
-            dip_dir = pd.read_excel("F:/DIP/data/DIP3.0国家目录库.xlsx")
+            dip_dir = pd.read_excel(str(get_data_dir() / "DIP3.0国家目录库.xlsx"))
             for _, row in dip_dir.iterrows():
                 dip_code = str(row.get('DIP编码', ''))
                 diag_code = str(row.get('主要诊断编码', '')) if pd.notna(row.get('主要诊断编码')) else ''
@@ -730,17 +731,17 @@ class DIPCalculationApp:
         dict_file = None
         
         if dict_name == "DIP3.0国家目录库":
-            dict_file = "F:/DIP/data/DIP3.0国家目录库.xlsx"
+            dict_file = str(get_data_dir() / "DIP3.0国家目录库.xlsx")
         elif dict_name == "低标目录":
-            dict_file = "F:/DIP/data/低标目录(1).xlsx"
+            dict_file = str(get_data_dir() / "低标目录(1).xlsx")
         elif dict_name == "ICD-10编码":
-            dict_file = "F:/DIP/data/ICD10国临版2.0对照医保版2.0_0125.xlsx"
+            dict_file = str(get_data_dir() / "ICD10国临版2.0对照医保版2.0_0125.xlsx")
         elif dict_name == "ICD-9-CM-3编码":
-            dict_file = "F:/DIP/data/ICD9国临版3.0对照医保版2.0_0125.xlsx"
+            dict_file = str(get_data_dir() / "ICD9国临版3.0对照医保版2.0_0125.xlsx")
         elif dict_name == "CCI合并症并发症":
-            dict_file = "F:/DIP/data/CCI.xlsx"
+            dict_file = str(get_data_dir() / "CCI.xlsx")
         elif dict_name == "疾病严重程度辅助目录":
-            dict_file = "F:/DIP/data/中重度分型诊断.xlsx"
+            dict_file = str(get_data_dir() / "中重度分型诊断.xlsx")
         
         try:
             if dict_file and Path(dict_file).exists():

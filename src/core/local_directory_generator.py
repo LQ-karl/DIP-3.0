@@ -18,6 +18,7 @@ from ..utils.data_loader import DataLoader
 from ..core.auxiliary_directory import (
     CCICalculator, DiseaseSeverityClassifier, AgeFeatureClassifier, ICUStayClassifier
 )
+from ..utils.paths import get_data_dir, get_output_dir
 
 
 class LocalDirectoryGenerator:
@@ -26,7 +27,7 @@ class LocalDirectoryGenerator:
     def __init__(
         self,
         threshold: int = 15,
-        data_dir: str = "F:\\DIP\\data",
+        data_dir: str = None,
         lower_quantile: float = 0.025,
         upper_quantile: float = 0.975,
         min_trim_group_size: int = 25,
@@ -46,7 +47,7 @@ class LocalDirectoryGenerator:
             max_overall_trim_rate: 整体裁剪率上限（默认 0.08，即最高 8%），超出则告警
         """
         self.threshold = threshold
-        self.data_dir = data_dir
+        self.data_dir = data_dir if data_dir else str(get_data_dir())
         self.lower_quantile = lower_quantile
         self.upper_quantile = upper_quantile
         self.min_trim_group_size = min_trim_group_size
@@ -1521,7 +1522,7 @@ class LocalDirectoryGenerator:
         self,
         settlement_file: str,
         national_directory_file: str = None,
-        output_dir: str = "F:\\DIP\\output"
+        output_dir: str = None
     ) -> str:
         """
         生成本地目录库（主入口）
@@ -1586,6 +1587,7 @@ class LocalDirectoryGenerator:
         
         # 导出结果
         print("\n导出本地目录库...")
+        output_dir = output_dir if output_dir else str(get_output_dir())
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         

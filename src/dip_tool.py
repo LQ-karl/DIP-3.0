@@ -22,19 +22,20 @@ from .core.payment_calculator import (
 from .core.local_directory_generator import LocalDirectoryGenerator
 from .interfaces.parser_4101a import Interface4101AParser
 from .utils.data_loader import DataLoader, DiseaseGroupLoader
+from .utils.paths import get_data_dir, get_output_dir
 
 
 class DIPGroupingTool:
     """DIP按病种分值分组测算工具"""
     
-    def __init__(self, data_dir: str = "F:\\DIP\\data"):
+    def __init__(self, data_dir: str = None):
         """
         初始化工具
         
         Args:
             data_dir: 数据目录路径
         """
-        self.data_dir = Path(data_dir)
+        self.data_dir = Path(data_dir) if data_dir else get_data_dir()
         
         # 初始化各模块
         self.grouping_engine = DIPGroupingEngine()
@@ -313,7 +314,7 @@ class DIPGroupingTool:
         
         return report
     
-    def generate_report(self, results: Dict, output_dir: str = "F:\\DIP\\output") -> str:
+    def generate_report(self, results: Dict, output_dir: str = None) -> str:
         """
         生成报告文件
         
@@ -324,6 +325,7 @@ class DIPGroupingTool:
         Returns:
             报告文件路径
         """
+        output_dir = output_dir if output_dir else str(get_output_dir())
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
         
@@ -341,7 +343,7 @@ class DIPGroupingTool:
         settlement_file: str,
         national_directory_file: str = None,
         threshold: int = 15,
-        output_dir: str = "F:\\DIP\\output"
+        output_dir: str = None
     ) -> str:
         """
         生成本地目录库（核心功能）
@@ -362,5 +364,5 @@ class DIPGroupingTool:
         return self.local_directory_generator.generate_local_directory(
             settlement_file=settlement_file,
             national_directory_file=national_directory_file,
-            output_dir=output_dir
+            output_dir=output_dir if output_dir else str(get_output_dir())
         )

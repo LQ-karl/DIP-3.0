@@ -1,11 +1,12 @@
 """
 DIP测算工具 - 分值测算可选方法测试（真实断言版）
 """
-import sys
-sys.path.insert(0, 'F:/DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
 from src.models.models import MedicalRecord
+from src.utils.paths import get_output_dir
 from src.core.value_calculator_selectable import (
     DIPValueCalculator, ValueCalculationConfig, ValueCalculationMethod,
     create_average_cost_config, create_reference_disease_config,
@@ -80,7 +81,7 @@ def test_average_cost_method():
     top = max(results, key=lambda r: r.disease_value)
     assert top.dip_code == "I21-1", "急性心肌梗死(费用最高)应获得最高分值"
 
-    out = "F:/DIP/output/test_value_average_cost.xlsx"
+    out = str(get_output_dir() / "test_value_average_cost.xlsx")
     calculator.export_results(results, out)
     from pathlib import Path
     assert Path(out).exists(), "平均费用法结果未导出"
@@ -100,7 +101,7 @@ def test_reference_disease_method():
     # mi(K35-1)=12800, M=12800 → RW = 1000
     assert abs(float(k35.disease_value) - 1000) < 1.0, f"基准病种 K35-1 的 RW 应≈1000，实际 {k35.disease_value}"
 
-    out = "F:/DIP/output/test_value_reference_disease.xlsx"
+    out = str(get_output_dir() / "test_value_reference_disease.xlsx")
     calculator.export_results(results, out)
     from pathlib import Path
     assert Path(out).exists()
@@ -129,7 +130,7 @@ def test_drug_value_method():
     top = max(results, key=lambda r: r.drug_value)
     assert top.dip_code == "I21-1"
 
-    out = "F:/DIP/output/test_value_drug.xlsx"
+    out = str(get_output_dir() / "test_value_drug.xlsx")
     calculator.export_results(results, out)
     from pathlib import Path
     assert Path(out).exists()
@@ -142,7 +143,7 @@ def test_consumable_value_method():
     results = calculator.calculate_all_values(records)
 
     _assert_value_results(results, value_attr="consumable_value")
-    out = "F:/DIP/output/test_value_consumable.xlsx"
+    out = str(get_output_dir() / "test_value_consumable.xlsx")
     calculator.export_results(results, out)
     from pathlib import Path
     assert Path(out).exists()

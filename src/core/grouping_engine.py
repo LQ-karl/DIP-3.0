@@ -16,6 +16,7 @@ from decimal import Decimal
 import re
 
 from ..models.models import DiseaseGroup, GroupType, MedicalRecord
+from ..utils.paths import get_data_dir
 from .disease_group_suitability import (
     DiseaseGroupingOptimizer, GroupingConfig, GroupingStatistics,
     create_default_optimizer
@@ -372,7 +373,7 @@ class DIPGroupingEngine:
         """
         try:
             import pandas as pd
-            dip_dir = pd.read_excel("F:/DIP/data/DIP3.0国家目录库.xlsx")
+            dip_dir = pd.read_excel(str(get_data_dir() / "DIP3.0国家目录库.xlsx"))
             
             # 查找该诊断编码的所有DIP条目
             matching_entries = dip_dir[dip_dir['主要诊断编码'] == diag_code]

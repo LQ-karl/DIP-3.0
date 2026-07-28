@@ -1,7 +1,11 @@
 import pandas as pd
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.utils.paths import get_data_dir
 
 # 读取DIP3.0国家目录库
-df = pd.read_excel('F:/DIP/data/DIP3.0国家目录库.xlsx')
+df = pd.read_excel(str(get_data_dir() / "DIP3.0国家目录库.xlsx"))
 
 print("=" * 60)
 print(f"当前DIP3.0国家目录库记录数: {len(df)}")

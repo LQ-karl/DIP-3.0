@@ -1,5 +1,8 @@
 import pandas as pd
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.utils.paths import get_data_dir, get_templates_dir
 
 # 4101A接口字段与中文名称对应关系
 field_mapping = {
@@ -179,7 +182,7 @@ chinese_df = pd.DataFrame([chinese_row])
 final_df = pd.concat([chinese_df, df], ignore_index=True)
 
 # 创建目录
-output_dir = Path('F:/DIP/templates')
+output_dir = get_templates_dir()
 output_dir.mkdir(exist_ok=True)
 
 # 保存为Excel

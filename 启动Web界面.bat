@@ -3,6 +3,10 @@ DIP3.0 Web界面启动脚本
 """
 import subprocess
 import sys
+import os
+
+# 定位 web/app.py（脚本位于项目根，故用本文件所在目录）
+WEB_APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "app.py")
 
 def main():
     print("=" * 60)
@@ -18,7 +22,7 @@ def main():
     # 启动streamlit
     cmd = [
         sys.executable, "-m", "streamlit", "run",
-        "F:/DIP/web/app.py",
+        WEB_APP,
         "--server.port", "8501",
         "--server.headless", "true"
     ]

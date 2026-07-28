@@ -1,8 +1,8 @@
 """
 DIP按病种分值分组测算工具 - 测试脚本（真实断言版）
 """
-import sys
-sys.path.insert(0, 'F:\\DIP')
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
 from src import DIPGroupingTool, DiseaseGroup, MedicalRecord, CalculationMethod
@@ -48,7 +48,7 @@ def _build_test_records():
 def test_basic_functionality():
     """端到端功能测试：set_threshold + 分组 + 分值 + 点值 + 支付标准。"""
     # 1. 初始化工具
-    tool = DIPGroupingTool(data_dir="F:\\DIP\\data")
+    tool = DIPGroupingTool()
     assert tool is not None
 
     # 2. 加载基础数据（缺失不应使测试崩溃）

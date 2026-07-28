@@ -1,5 +1,8 @@
 import pandas as pd
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.utils.paths import get_data_dir, get_templates_dir
 
 # 创建空模板（只有表头）
 columns = [
@@ -26,7 +29,7 @@ columns = [
 df = pd.DataFrame(columns=columns)
 
 # 创建目录
-output_dir = Path('F:/DIP/templates')
+output_dir = get_templates_dir()
 output_dir.mkdir(exist_ok=True)
 
 # 保存空模板
