@@ -1,0 +1,21 @@
+# ===== Python 缓存 / 编译产物 =====
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ===== 运行生成物 / 日志 =====
+output/
+gui_log.txt
+
+# ===== 智能体工作记忆（非项目源码）=====
+.workbuddy/
+
+# ===== 参考文档（体积大、非运行/测试所必需，不纳入版本库）=====
+# data/ 下的业务字典(.xlsx) 与示例配置(.json) 仍会提交，供 CI 使用
+data/*.pdf
+data/*.txt
+data/*.docx

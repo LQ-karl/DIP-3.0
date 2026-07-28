@@ -1,0 +1,46 @@
+# DIP3.0 本地目录测算系统 - CI
+#
+# ⚠️ 前置条件（当前仓库尚未满足，需先处理否则 CI 会失败）：
+#   1. 初始化 git 并提交整个仓库，且必须包含：
+#        - data/            目录（CCI.xlsx、中重度分型诊断.xlsx、DIP3.0国家目录库.xlsx 等）
+#        - tests/sample_settlement_data.xlsx
+#      （这些本地数据文件当前不在版本控制中，CI 运行环境无法获取）
+#   2. 参数化硬编码路径。代码与测试中存在大量绝对路径 `F:\DIP\...`
+#      （即此前建议的「① 补 config 配置层」）。在 CI（Linux/非 F: 盘）上这些路径
+#      不存在，测试会 FileNotFound。建议改为相对仓库根或读环境变量/DIP_DATA_DIR。
+#
+# 完成上述两点后，本工作流即可在 push / PR 时自动跑通非 GUI 测试套件。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pdfplumber
+
+      - name: Run tests (non-GUI)
+        run: pytest

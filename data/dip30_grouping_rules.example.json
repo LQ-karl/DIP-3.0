@@ -1,0 +1,20 @@
+{
+  "_comment": "DIP3.0 核心病种前三层成组规则——权威清单补充模板。复制本文件为 dip30_grouping_rules.json 即可被 LocalDirectoryGenerator 自动加载（覆盖/扩充内置种子，无需改代码）。所有字段均可省略；省略即沿用内置种子。",
+  "merge_diag_families": [
+    "I20"
+  ],
+  "op_merge_diag_set": [
+    "D18.0"
+  ],
+  "op_merge_map": {
+    "39.9016": "REN_STENT_BALLOON",
+    "39.5002": "REN_STENT_BALLOON"
+  },
+  "priority_transplant_ops": [
+    "55.6", "55.69", "50.51", "50.59", "37.51", "33.5", "52.8", "46.97",
+    "41.0", "41.04", "41.05", "41.06", "41.07", "41.08", "41.09"
+  ],
+  "priority_life_support_ops": [
+    "39.6", "39.95", "96.7", "93.9", "37.6"
+  ]
+}
