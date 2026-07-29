@@ -23,7 +23,48 @@ from ..utils.paths import get_data_dir, get_output_dir
 
 class LocalDirectoryGenerator:
     """本地目录库生成器"""
-    
+
+    # ---- 核心病种成组·范围与字典常量（《DIP3.0版分组征求地方意见的函》） ----
+    # ③ 诊断辅助细分·肿瘤其他诊断允许类目
+    #    允许范围: C00-C75 / C76-C80 / C81-C86 / C88 / C90 / C91-C95（不含 D00-D48 / C87 / C89 / C97）
+    NEOPLASM_ALLOWED_RANGES = [(0, 75), (76, 80), (81, 86), (88, 88), (90, 90), (91, 95)]
+
+    # ③ 诊断辅助细分·结核耐药拓展码（《函》明确清单，默认启用；
+    #    仍可由 data/dip30_grouping_rules.json 的 tb_drug_resistance_ext 追加）
+    TB_DRUG_RESISTANT_CODES = (
+        "A15.000x010", "A15.100x002", "A15.000x012", "A15.100x003",
+        "A15.000x014", "A15.100x004", "A15.000x016", "A15.100x005",
+        "A15.000x018", "A15.100x006", "A15.000x020", "A15.100x007",
+        "A15.000x022", "A15.100x008", "A15.000x024", "A15.100x009",
+        "A15.000x026", "A15.100x010", "A15.000x028", "A15.100x011",
+        "A15.500x010", "A15.500x011", "A15.500x012", "A15.500x013",
+        "A15.500x014", "A15.500x015", "A15.500x016", "A15.500x017",
+        "A15.500x018", "A15.500x019", "A15.500x020", "A15.500x021",
+        "A15.500x022", "A15.500x023", "A15.500x024", "A15.500x025",
+        "A15.500x026", "A15.500x027", "A15.500x028", "A15.500x029",
+        "A19.000x001", "A19.000x002", "A19.000x003", "A19.000x004",
+        "A19.000x005", "A19.000x006", "A19.000x007", "A19.000x008",
+        "A19.000x009", "A19.000x010", "A19.000x011", "A19.000x012",
+        "A19.000x013", "A19.000x014", "A19.000x015", "A19.000x016",
+        "A19.000x017", "A19.000x018", "A19.000x019", "A19.000x020",
+    )
+
+    # ③ 诊断辅助细分·烧伤深度（T29/T30 第4位深度码 → 深度命名）
+    # 注：.5/.6/.7 的临床深度命名需与《函》4974–5015 对齐确认（此处为暂定映射，保证分组可区分）
+    BURN_DEGREE = {
+        "1": "Ⅰ度", "2": "Ⅱ度", "3": "Ⅲ度",
+        "5": "深Ⅱ度", "6": "深Ⅲ度", "7": "Ⅳ度",
+    }
+    # ③ 诊断辅助细分·烧伤面积（T31/T32 第4位 → 体表累及面积区间）
+    BURN_AREA = {
+        "0": "<10%", "1": "10-19%", "2": "20-29%", "3": "30-39%", "4": "40-49%",
+        "5": "50-59%", "6": "60-69%", "7": "70-79%", "8": "80-89%", "9": "≥90%",
+    }
+    # ③ 诊断辅助细分·烧伤年龄分界（岁）：低于该值归「儿童(小儿)」
+    BURN_PEDIATRIC_AGE = 14
+    # 先期分组·低出生体重判定阈值（g）：高于该值不属低出生体重，不进入先期分组
+    LBW_BIRTH_WEIGHT_THRESHOLD = 2500
+
     def __init__(
         self,
         threshold: int = 15,
@@ -373,6 +414,17 @@ class LocalDirectoryGenerator:
             # 其他字段
             '病例数': 'case_count',
             'case_count': 'case_count',
+
+            # 新生儿 / 人口学字段（先期分组·低出生体重、烧伤/肿瘤年龄推算）
+            '出生体重': 'birth_weight',
+            '新生儿出生体重': 'birth_weight',
+            '出生体重(g)': 'birth_weight',
+            'birth_weight': 'birth_weight',
+            '出生日期': 'birth_date',
+            'birth_date': 'birth_date',
+            '入院时间': 'admission_date',
+            '入院日期': 'admission_date',
+            'admission_date': 'admission_date',
         }
         
         # 重命名列
@@ -537,8 +589,9 @@ class LocalDirectoryGenerator:
         # 无创通气 93.9x（睡眠呼吸暂停 G47.3 不属先期）、IABP 主动脉内球囊反搏 37.6x
         self._priority_life_support_ops = {"39.6", "39.95", "96.7", "93.9", "37.6"}
 
-        # ③ 诊断辅助细分·结核耐药拓展码（可配置；默认空 → 仅依赖其他诊断 U84.300）
-        self._tb_drug_resistance_ext: set = set()
+        # ③ 诊断辅助细分·结核耐药拓展码（默认内置《函》明确清单；
+        #   仍可由 data/dip30_grouping_rules.json 的 tb_drug_resistance_ext 追加）
+        self._tb_drug_resistance_ext: set = set(self.TB_DRUG_RESISTANT_CODES)
 
         # ---------- ② 并项规则 ----------
         # 诊断并项：指定诊断族在 3 位码下归并（种子：心绞痛 I20.x -> I20）
@@ -580,35 +633,113 @@ class LocalDirectoryGenerator:
             print(f"警告: 加载成组规则 JSON 失败: {e}")
 
     def _detect_priority(
-        self, main_diag_code: str, main_oprn_code: str, related_oprn_code: str
+        self, main_diag_code: str, main_oprn_code: str, related_oprn_code: str,
+        day_age: int = 0, birth_weight: Decimal = Decimal("0"),
+        age: int = 0, birth_date: str = "", admission_date: str = "",
     ) -> str:
         """先期分组检测：返回先期成组键或 None。
 
-        先期分组多不区分主要诊断，依靠主要手术操作。三类：
-          低出生体重儿（P07.x）/ 器官移植（实体器官手术前缀）/ 呼吸循环支持
-          （ECMO/CRRT/呼吸机/IABP，无创通气排除睡眠呼吸暂停）。
+        先期分组均不区分主要诊断，依据《函》4956–4973：
+          - 器官移植：实体/造血干细胞移植手术码前缀（依靠主要/相关手术操作）
+          - 呼吸循环支持：ECMO/CRRT/呼吸机/无创通气/IABP 手术码前缀（依靠手术操作）
+          - 低出生体重儿：年龄不足1周岁（天龄/年龄/出生+入院日期推算）且出生体重
+            属低出生体重(<2500g)，按 年龄分桶 + 出生体重分桶 分组
         """
         diag = self._clean_str(main_diag_code).upper()
         ops = [self._norm_op_code(main_oprn_code), self._norm_op_code(related_oprn_code)]
         ops = [o for o in ops if o]
 
-        # 低出生体重儿
-        if diag.startswith("P07"):
-            return f"PRI|LBW|{diag}"
-
-        # 器官移植（实体器官/造血干细胞）：手术码前缀精确匹配
+        # 器官移植（实体器官/造血干细胞）：手术码前缀精确匹配，不区分主要诊断
         for op in ops:
             if any(op.startswith(p) for p in self._priority_transplant_ops):
                 return f"PRI|TRANSPLANT|{op}"
 
-        # 呼吸循环支持（无创通气 93.9x 排除睡眠呼吸暂停 G47.3）
+        # 呼吸循环支持：ECMO/CRRT/呼吸机/无创通气/IABP，不区分主要诊断
         for op in ops:
             if any(op.startswith(p) for p in self._priority_life_support_ops):
-                if op.startswith("93.9") and diag.startswith("G47.3"):
-                    continue
                 return f"PRI|LIFESUPPORT|{op}"
 
+        # 低出生体重儿：不区分主要诊断，依靠 年龄(天) + 新生儿出生体重(g) 分组
+        # 仅当 年龄不足1周岁 且 出生体重属低出生体重(<2500g) 时进入先期分组，
+        # 避免与 ③ 烧伤等婴儿病种冲突（正常体重婴儿不占先期分组）。
+        if self._is_under_one_year(age, day_age, birth_date, admission_date):
+            if Decimal("0") < birth_weight < Decimal(str(self.LBW_BIRTH_WEIGHT_THRESHOLD)):
+                age_bucket = "新生儿期" if (day_age or 0) <= 28 else "婴儿期"
+                weight_bucket = self._lbw_weight_bucket(birth_weight)
+                return f"PRI|LBW|{age_bucket}|{weight_bucket}"
+
         return None
+
+    # ------------------------------------------------------------------
+    # 先期分组辅助：年龄/出生体重判定（低出生体重儿，依据《函》4969–4973）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_under_one_year(age, day_age, birth_date, admission_date) -> bool:
+        """判断是否年龄不足1周岁（<365天）。
+
+        优先用 出生日期 + 入院时间 推算；否则以 天龄(day_age) > 0 判定。
+        注意：年龄(岁)字段缺失默认 0，不可单独作为判婴依据，以免成年患者被误判。
+        """
+        import datetime
+        bd = LocalDirectoryGenerator._clean_str(birth_date)
+        ad = LocalDirectoryGenerator._clean_str(admission_date)
+        if bd and ad:
+            try:
+                b = datetime.datetime.strptime(bd[:10], "%Y-%m-%d")
+                a = datetime.datetime.strptime(ad[:10], "%Y-%m-%d")
+                days = (a - b).days
+                if days >= 0:
+                    return days < 365
+            except Exception:
+                pass
+        try:
+            if int(day_age or 0) > 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _lbw_weight_bucket(weight_grams) -> str:
+        """新生儿出生体重(g)分桶：超低<1000 / 极低1000-1499 / 低1500-2499。"""
+        try:
+            w = float(weight_grams)
+        except Exception:
+            return "未知"
+        if w < 1000:
+            return "超低出生体重"
+        if w < 1500:
+            return "极低出生体重"
+        if w < 2500:
+            return "低出生体重"
+        return "正常体重"
+
+    @staticmethod
+    def _calc_age_years(age, day_age, birth_date, admission_date) -> int:
+        """推算年龄(岁)：优先 出生日期+入院时间；否则 年龄(岁)；否则 天龄//365。"""
+        import datetime
+        bd = LocalDirectoryGenerator._clean_str(birth_date)
+        ad = LocalDirectoryGenerator._clean_str(admission_date)
+        if bd and ad:
+            try:
+                b = datetime.datetime.strptime(bd[:10], "%Y-%m-%d")
+                a = datetime.datetime.strptime(ad[:10], "%Y-%m-%d")
+                days = (a - b).days
+                if days >= 0:
+                    return days // 365
+            except Exception:
+                pass
+        try:
+            if int(age or 0) > 0:
+                return int(age)
+        except Exception:
+            pass
+        try:
+            if int(day_age or 0) > 0:
+                return int(day_age) // 365
+        except Exception:
+            pass
+        return 0
 
     def _get_op_category(self, insurance_op_code: str) -> str:
         """医保版手术码 -> 手术类别（手术/治疗性操作/诊断性操作/介入治疗/''）。"""
@@ -707,6 +838,11 @@ class LocalDirectoryGenerator:
         main_oprn_code: str,
         related_oprn_code: str,
         related_diag_code: str = "",
+        day_age: int = 0,
+        birth_weight: Decimal = Decimal("0"),
+        age: int = 0,
+        birth_date: str = "",
+        admission_date: str = "",
     ) -> str:
         """核心病种成组键（DIP3.0 规范四层顺序）。
 
@@ -727,7 +863,10 @@ class LocalDirectoryGenerator:
         diag3 = self._extract_icd3(main_diag_code)
 
         # ① 先期分组（最高优先级，多不区分主要诊断）
-        pri = self._detect_priority(main_diag_code, main_oprn_code, related_oprn_code)
+        pri = self._detect_priority(
+            main_diag_code, main_oprn_code, related_oprn_code,
+            day_age, birth_weight, age, birth_date, admission_date,
+        )
         if pri is not None:
             return pri
 
@@ -748,7 +887,8 @@ class LocalDirectoryGenerator:
         #   与第三步「触发式辅助分型」(严重程度/年龄/ICU/CCI) 机制/阶段/字段/输出均不同，
         #   此处仅做核心病种成组层细分，产出独立核心病种组（各自 RW）。
         aux = self._refine_diagnostic_auxiliary(
-            main_diag_code, main_oprn_code, related_oprn_code, related_diag_code
+            main_diag_code, main_oprn_code, related_oprn_code, related_diag_code,
+            age=age, day_age=day_age, birth_date=birth_date, admission_date=admission_date,
         )
         if aux is not None:
             return aux
@@ -774,12 +914,16 @@ class LocalDirectoryGenerator:
 
     @staticmethod
     def _neoplasm_category(related_diag_code: str) -> str:
-        """从其他/相关诊断取首个肿瘤类别(C00-C96/D00-D48)的 3 位码；无则返回 ''。"""
+        """从其他/相关诊断取首个肿瘤类别(限定《函》4974–5015 范围)的 3 位码；无则返回 ''。
+
+        允许范围: C00-C75 / C76-C80 / C81-C86 / C88 / C90 / C91-C95
+        （不含 D00-D48 癌前病变/动态未定，亦不含 C87/C89/C97）。
+        """
         for c in LocalDirectoryGenerator._split_codes(related_diag_code):
-            if c[:1] == "C" and len(c) >= 3 and c[1:3].isdigit() and 0 <= int(c[1:3]) <= 96:
-                return c[:3]
-            if c[:1] == "D" and len(c) >= 3 and c[1:3].isdigit() and 0 <= int(c[1:3]) <= 48:
-                return c[:3]
+            if len(c) >= 3 and c[0] == "C" and c[1:3].isdigit():
+                n = int(c[1:3])
+                if any(lo <= n <= hi for lo, hi in LocalDirectoryGenerator.NEOPLASM_ALLOWED_RANGES):
+                    return c[:3]
         return ""
 
     @staticmethod
@@ -811,9 +955,46 @@ class LocalDirectoryGenerator:
                 return True
         return False
 
+    def _classify_burn(
+        self, main_diag_code: str, related_diag_code: str,
+        age: int, day_age: int, birth_date: str, admission_date: str,
+    ) -> Optional[str]:
+        """③ 诊断辅助细分·烧伤类（依据《函》烧伤条目）：先区分年龄，再按
+        烧伤程度(主要诊断 T29/T30 指定深度码) + 面积(次要诊断 T31/T32 类目) 分组。
+
+        返回 AUX|BURN|<年龄分段>|<烧伤深度>|<面积区间>；非烧伤病种返回 None。
+        """
+        diag = self._clean_str(main_diag_code).upper()
+        # 烧伤程度：主要诊断命中 T29/T30 指定深度码（第4位深度码）
+        degree = None
+        for c in self._split_codes(diag):
+            if c.startswith("T29.") or c.startswith("T30."):
+                after = c.split(".", 1)[1] if "." in c else ""
+                d = after[0] if after else ""
+                if d in self.BURN_DEGREE:
+                    degree = self.BURN_DEGREE[d]
+                    break
+        if degree is None:
+            return None
+        # 面积：次要诊断含 T31/T32（按体表累及面积），取第4位对应面积区间
+        area = "未特指面积"
+        for c in self._split_codes(related_diag_code):
+            if c.startswith("T31") or c.startswith("T32"):
+                after = c.split(".", 1)[1] if "." in c else ""
+                a = after[0] if after else ""
+                if a in self.BURN_AREA:
+                    area = self.BURN_AREA[a]
+                    break
+        # 年龄：先区分年龄（岁）
+        age_years = self._calc_age_years(age, day_age, birth_date, admission_date)
+        age_bucket = "儿童(小儿)" if age_years < self.BURN_PEDIATRIC_AGE else "成人"
+        return f"AUX|BURN|{age_bucket}|{degree}|{area}"
+
     def _refine_diagnostic_auxiliary(
         self, main_diag_code: str, main_oprn_code: str,
         related_oprn_code: str, related_diag_code: str,
+        age: int = 0, day_age: int = 0,
+        birth_date: str = "", admission_date: str = "",
     ) -> Optional[str]:
         """③ 诊断辅助细分：核心病种第三层成组。
 
@@ -836,6 +1017,13 @@ class LocalDirectoryGenerator:
             neo3 = self._neoplasm_category(related_diag_code)
             if neo3:
                 return f"AUX|TUMOR|{neo3}|{self._tumor_treatment_tag(main_oprn_code, related_oprn_code)}"
+
+        # ---- (C) 烧伤类病种：先年龄，再 烧伤程度(T29/T30) + 面积(T31/T32) ----
+        burn = self._classify_burn(
+            main_diag_code, related_diag_code, age, day_age, birth_date, admission_date
+        )
+        if burn is not None:
+            return burn
 
         # ---- (B) 结核耐药 ----
         if diag[:2] == "A1" and diag[:3] in ("A15", "A16", "A17", "A18", "A19"):
@@ -952,13 +1140,20 @@ class LocalDirectoryGenerator:
             main_oprn = self._clean_str(row.get('main_oprn_code'))
             related_oprn = self._clean_str(row.get('related_oprn_code'))
             related_diag = self._clean_str(row.get('related_diag_code'))
+            day_age = self._safe_int(row.get('day_age', 0))
+            birth_weight = self._safe_decimal(row.get('birth_weight', 0))
+            age = self._safe_int(row.get('age', 0))
+            birth_date = self._clean_str(row.get('birth_date'))
+            admission_date = self._clean_str(row.get('admission_date'))
 
             if not main_diag:
                 continue
 
-            # 可插拔：先期分组 / 并项规则 / 诊断辅助细分（当前仅基本规则层）
+            # 可插拔：先期分组 / 并项规则 / 诊断辅助细分
             cluster_key = self._refine_core_group_key(
-                main_diag, main_oprn, related_oprn, related_diag
+                main_diag, main_oprn, related_oprn, related_diag,
+                day_age=day_age, birth_weight=birth_weight, age=age,
+                birth_date=birth_date, admission_date=admission_date,
             )
 
             cost = Decimal(str(row.get('total_cost', 0)))

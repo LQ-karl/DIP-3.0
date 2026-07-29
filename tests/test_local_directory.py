@@ -279,22 +279,28 @@ def test_core_disease_priority_and_merge():
     """核心病种前三层（先期分组 / 并项规则）成组键校验。
 
     构造样例验证：
-      ① 先期分组：低出生体重(P07) / 器官移植(55.6901肾移植) / 呼吸循环支持
-         (96.7101呼吸机) 各自形成 PRI| 前缀的独立组，且不误伤组织移植(角膜11.6000)/
-         冠脉旁路(36.1200)；
+      ① 先期分组：低出生体重(不足1周岁+出生体重<2500g，不看诊断) /
+         器官移植(55.6901肾移植) / 呼吸循环支持(96.7101呼吸机)
+         各自形成 PRI| 前缀的独立组，且不误伤组织移植(角膜11.6000)/
+         冠脉旁路(36.1200)；对照：足月正常体重新生儿不进先期；
       ② 并项规则：D18.0 多术式整体并项、I20.0/I20.1 诊断并项(3位码)、
          I70.1 肾动脉支架+球囊联合手术并项，均合并为单一组；
       ③ 普通病种仍走基本规则键。
     """
     rows = []
-    def add(dx, op="", n=3, cost=10000):
+    def add(dx, op="", n=3, cost=10000, **extra):
         for i in range(n):
-            rows.append({
+            row = {
                 "主要诊断代码": dx, "主要诊断名称": dx,
                 "主要手术操作代码": op, "主要手术操作名称": op or "",
                 "医疗总费用": cost + i * 10,
-            })
-    add("P07.0", "")                       # ① 低出生体重
+            }
+            row.update(extra)
+            rows.append(row)
+    # ① 低出生体重：天龄10天 + 出生体重1400g（极低体重）→ PRI|LBW
+    add("P07.0", "", **{"天龄": 10, "出生体重": 1400})
+    # 对照: 新生儿但体重正常(3200g) → 不进先期
+    add("P59.9", "", **{"天龄": 5, "出生体重": 3200})
     add("N18.5", "55.6901")                 # ① 器官移植(肾)
     add("A41.9", "96.7101")                 # ① 呼吸循环支持(呼吸机)
     add("H16.0", "11.6000", n=3)            # 对照: 角膜移植(组织移植, 非先期)
@@ -316,12 +322,17 @@ def test_core_disease_priority_and_merge():
     # ① 先期：三类各一组
     pri = [k for k in keys if k.startswith("PRI|")]
     assert len(pri) == 3, f"先期组应恰好 3 个(PRI|)，实际 {pri}"
-    assert any(k.startswith("PRI|LBW|") for k in pri)
+    lbw = [k for k in pri if k.startswith("PRI|LBW|")]
+    assert len(lbw) == 1, f"低出生体重应 1 组, 实际 {lbw}"
+    assert "新生儿期" in lbw[0] and "极低" in lbw[0], \
+        f"天龄10+1400g 应为 新生儿期|极低出生体重档, 实际 {lbw[0]}"
     assert any(k.startswith("PRI|TRANSPLANT|") for k in pri)
     assert any(k.startswith("PRI|LIFESUPPORT|") for k in pri)
     # 角膜移植 / 冠脉旁路 不应进入先期
     assert not any(k.startswith("H16|") and "PRI" in k for k in keys)
     assert not any(k.startswith("I25|36.1200") and "PRI" in k for k in keys)
+    # 正常体重新生儿(P59.9, 3200g) 不应进先期，应走基本规则
+    assert any(k.startswith("P59|") for k in keys), "正常体重新生儿应走基本规则键"
 
     # ② 并项：D18.0 两术式 -> 1 组
     d18 = [k for k in keys if k.startswith("D18|")]
@@ -491,19 +502,25 @@ def test_diagnostic_auxiliary_subdivision():
           → AUX|TUMOR|<肿瘤3位>|<治疗方式>
       (B) 结核耐药：A15-A19 + (主诊断含耐药拓展码 或 其他诊断含 U84.300)
           → AUX|TB|<A15-A16/A17/A18/A19>|<耐药/非耐药>
-    非肿瘤非结核病种不进入 ③，保留基本规则键（不与辅助分型混淆）。
+      (C) 烧伤类：先区分年龄(儿童<14/成人)，再按 深度(主诊断 T29/T30 深度码)
+          + 面积(次要诊断 T31/T32) → AUX|BURN|<年龄>|<深度>|<面积>
+    非肿瘤非结核非烧伤病种不进入 ③，保留基本规则键（不与辅助分型混淆）。
+    肿瘤其他诊断范围收窄为 C00-C75/C76-C80/C81-C86/C88/C90/C91-C95，
+    C87/C89/C96/C97/D 类不再触发肿瘤细分。
     """
     rows = []
 
-    def add(dx, op="", relop="", reldx="", n=1):
+    def add(dx, op="", relop="", reldx="", n=1, **extra):
         for _ in range(n):
-            rows.append({
+            row = {
                 "主要诊断代码": dx, "主要诊断名称": "",
                 "主要手术操作代码": op, "主要手术操作名称": "",
                 "相关手术操作代码": relop, "相关手术操作名称": "",
                 "相关诊断代码": reldx,
                 "医疗总费用": 10000,
-            })
+            }
+            row.update(extra)
+            rows.append(row)
 
     # (A) 肿瘤放化疗靶向免疫
     add("Z51.1", relop="99.2503", reldx="C80")                              # 化疗
@@ -512,10 +529,21 @@ def test_diagnostic_auxiliary_subdivision():
     add("Z51.1", relop="99.2503+99.2800x006", reldx="C88")                  # 化疗+靶向
     add("Z51.1", relop="99.2503+99.2800x006+99.2800x005", reldx="C91")       # 三联
     add("Z51.1", reldx="C80")                                               # 无手术 → 其他
+    # (A-负例) 肿瘤范围收窄：C97 / D18 不再触发肿瘤细分 → 走基本规则
+    add("Z51.1", relop="99.2503", reldx="C97")
+    add("Z51.1", relop="99.2503", reldx="D18.0")
     # (B) 结核耐药
     add("A15.1", reldx="")                                                  # 非耐药
     add("A16", reldx="U84.300")                                             # 耐药(U84.300)
     add("A17", reldx="U84.300;A15.0")                                       # 耐药(U84.300)
+    add("A15.000x010", reldx="")                                            # 耐药(主诊断拓展码)
+    # (C) 烧伤类
+    add("T30.2", reldx="T31.1", **{"年龄": 35})    # 成人 Ⅱ度 10-19%
+    add("T30.2", reldx="T31.1", **{"年龄": 5})     # 儿童 Ⅱ度 10-19%
+    add("T30.5", reldx="T31.4", **{"年龄": 40})    # 成人 深Ⅱ度 40-49%
+    add("T30.3", reldx="", **{"年龄": 50})          # 成人 Ⅲ度 未特指面积
+    # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分
+    add("T31.1", reldx="", **{"年龄": 35})
     # 对照：普通基本规则病种
     add("K35.9", op="47.0100", n=2)                                         # 不应进入 ③
 
@@ -531,17 +559,32 @@ def test_diagnostic_auxiliary_subdivision():
     assert "AUX|TUMOR|C88|化疗+靶向" in keys
     assert "AUX|TUMOR|C91|化疗+靶向+免疫" in keys
     assert "AUX|TUMOR|C80|其他" in keys
-    # (B) 结核
+    # (A-负例) C97 / D18 已收窄出肿瘤范围 → 走基本规则(Z51 开头)
+    assert not any(k.startswith("AUX|TUMOR|C97") for k in keys)
+    assert not any(k.startswith("AUX|TUMOR|D18") for k in keys)
+    assert any(k.startswith("Z51|") for k in keys), "收窄后 Z51.1+C97/D18 应走基本规则"
+    # (B) 结核（A15.000x010 主诊断耐药拓展码 与 A16+U84.300 同并入 A15-A16|耐药）
     assert "AUX|TB|A15-A16|非耐药" in keys
     assert "AUX|TB|A15-A16|耐药" in keys
     assert "AUX|TB|A17|耐药" in keys
+    tb_resistant = groups["AUX|TB|A15-A16|耐药"]
+    assert tb_resistant.case_count == 2, \
+        f"U84.300 与主诊断拓展码两条路径应并入同组(2例)，实际 {tb_resistant.case_count}"
+    # (C) 烧伤：年龄 × 深度 × 面积
+    assert "AUX|BURN|成人|Ⅱ度|10-19%" in keys
+    assert "AUX|BURN|儿童(小儿)|Ⅱ度|10-19%" in keys
+    assert "AUX|BURN|成人|深Ⅱ度|40-49%" in keys
+    assert "AUX|BURN|成人|Ⅲ度|未特指面积" in keys
+    # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分
+    assert not any(k.startswith("AUX|BURN") and "T31" in k for k in keys)
+    assert any(k.startswith("T31|") for k in keys), "T31 主诊断应走基本规则"
 
     # ③ 与基本规则互不干扰：对照组 K35 走基本规则，不在 ③
     assert "K35|47.0100|" in keys
     assert not any(k.startswith("AUX|K35") for k in keys)
     # 所有 ③ 键均以 AUX| 开头（成组层标记），与辅助分型(不产键、仅加元数据)区分
     aux_keys = [k for k in keys if k.startswith("AUX|")]
-    assert len(aux_keys) == 9, f"③ 应恰好 9 个 AUX 组，实际 {aux_keys}"
+    assert len(aux_keys) == 13, f"③ 应恰好 13 个 AUX 组，实际 {aux_keys}"
 
 
 if __name__ == "__main__":
