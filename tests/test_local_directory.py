@@ -502,8 +502,8 @@ def test_diagnostic_auxiliary_subdivision():
           → AUX|TUMOR|<肿瘤3位>|<治疗方式>
       (B) 结核耐药：A15-A19 + (主诊断含耐药拓展码 或 其他诊断含 U84.300)
           → AUX|TB|<A15-A16/A17/A18/A19>|<耐药/非耐药>
-      (C) 烧伤类：先区分年龄(儿童<14/成人)，再按 深度(主诊断 T29/T30 深度码)
-          + 面积(次要诊断 T31/T32) → AUX|BURN|<年龄>|<深度>|<面积>
+      (C) 烧伤类：先区分年龄(<18岁/≥18岁)，再按 程度(主诊断 T29多部位/T30单部位 + 第4位深度码)
+          + 面积(次要诊断 T31/T32 类目) 细分，严格对齐《函》5016–5039 → 返回条目号 DIP 编码
     非肿瘤非结核非烧伤病种不进入 ③，保留基本规则键（不与辅助分型混淆）。
     肿瘤其他诊断范围收窄为 C00-C75/C76-C80/C81-C86/C88/C90/C91-C95，
     C87/C89/C96/C97/D 类不再触发肿瘤细分。
@@ -537,11 +537,11 @@ def test_diagnostic_auxiliary_subdivision():
     add("A16", reldx="U84.300")                                             # 耐药(U84.300)
     add("A17", reldx="U84.300;A15.0")                                       # 耐药(U84.300)
     add("A15.000x010", reldx="")                                            # 耐药(主诊断拓展码)
-    # (C) 烧伤类
-    add("T30.2", reldx="T31.1", **{"年龄": 35})    # 成人 Ⅱ度 10-19%
-    add("T30.2", reldx="T31.1", **{"年龄": 5})     # 儿童 Ⅱ度 10-19%
-    add("T30.5", reldx="T31.4", **{"年龄": 40})    # 成人 深Ⅱ度 40-49%
-    add("T30.3", reldx="", **{"年龄": 50})          # 成人 Ⅲ度 未特指面积
+    # (C) 烧伤类（严格对齐《函》5016–5039，返回条目号 DIP 编码）
+    add("T30.2", reldx="T31.1", **{"年龄": 35})    # 成人 二度 ≥18 10%-20% → 5025
+    add("T30.2", reldx="T31.1", **{"年龄": 5})     # 儿童 二度 <18 10%以上 → 5023
+    add("T30.5", reldx="T31.4", **{"年龄": 40})    # 成人 三度 ≥18 30%以上 → 5021
+    add("T30.3", reldx="", **{"年龄": 50})          # 成人 三度 ≥18 缺面积(最小档) → 5018
     # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分
     add("T31.1", reldx="", **{"年龄": 35})
     # 对照：普通基本规则病种
@@ -570,21 +570,26 @@ def test_diagnostic_auxiliary_subdivision():
     tb_resistant = groups["AUX|TB|A15-A16|耐药"]
     assert tb_resistant.case_count == 2, \
         f"U84.300 与主诊断拓展码两条路径应并入同组(2例)，实际 {tb_resistant.case_count}"
-    # (C) 烧伤：年龄 × 深度 × 面积
-    assert "AUX|BURN|成人|Ⅱ度|10-19%" in keys
-    assert "AUX|BURN|儿童(小儿)|Ⅱ度|10-19%" in keys
-    assert "AUX|BURN|成人|深Ⅱ度|40-49%" in keys
-    assert "AUX|BURN|成人|Ⅲ度|未特指面积" in keys
+    # (C) 烧伤：严格对齐《函》条目号（程度×年龄×面积）
+    assert "5025" in keys, "成人 二度 ≥18 10%-20% 应→5025"
+    assert "5023" in keys, "儿童 二度 <18 10%以上 应→5023"
+    assert "5021" in keys, "成人 三度 ≥18 30%以上 应→5021"
+    assert "5018" in keys, "成人 三度 缺面积(最小档) 应→5018"
+    for b in ("5025", "5023", "5021", "5018"):
+        assert getattr(groups[b], "national_matched", False) is True, f"{b} 应标记 national_matched"
+        assert getattr(groups[b], "grouping_layer", "") == "诊断辅助细分"
     # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分
-    assert not any(k.startswith("AUX|BURN") and "T31" in k for k in keys)
+    assert not any(k.startswith("AUX|BURN") for k in keys), "烧伤不再使用 AUX|BURN 描述键"
     assert any(k.startswith("T31|") for k in keys), "T31 主诊断应走基本规则"
 
     # ③ 与基本规则互不干扰：对照组 K35 走基本规则，不在 ③
     assert "K35|47.0100|" in keys
     assert not any(k.startswith("AUX|K35") for k in keys)
-    # 所有 ③ 键均以 AUX| 开头（成组层标记），与辅助分型(不产键、仅加元数据)区分
+    # ③ 成组层标记：肿瘤/结核为 AUX| 描述键（未加载国家目录库时），烧伤为《函》条目号键
     aux_keys = [k for k in keys if k.startswith("AUX|")]
-    assert len(aux_keys) == 13, f"③ 应恰好 13 个 AUX 组，实际 {aux_keys}"
+    assert len(aux_keys) == 9, f"③ 未加载国家库时应为 6 肿瘤+3 结核=9 个 AUX 组，实际 {aux_keys}"
+    burn_item_keys = [k for k in keys if k.isdigit() and 5016 <= int(k) <= 5039]
+    assert len(burn_item_keys) == 4, f"烧伤应产出 4 个《函》条目号键，实际 {burn_item_keys}"
 
 
 def test_national_dip_alignment():
@@ -595,7 +600,7 @@ def test_national_dip_alignment():
          P07-01(<750g)/P07-02(750-999)/P07-03(1000-1499)/P07-04(1500-1999)/P07-05(2000-2499)
       ③ 肿瘤(函4974-5015)：Z51.1/Z51.8 × C范围(6档) × 治疗组合(7种) → Z51.x-NN
       ③ 结核(函5040-5061)：A15-A16/A17/A18/A19 × 术式组 × 耐药 → A15-A16-NN 等
-      ③ 烧伤(函5016-5039)：xlsx 导出截断缺失该段 → 保持 AUX|BURN 降级键
+      ③ 烧伤(函5016-5039)：自包含《函》24 组 → 直出条目号 DIP 编码（不依赖 xlsx 导出）
     未加载国家目录库时仍走描述性键（由前两个用例覆盖，向后兼容）。
     """
     rows = []
@@ -670,8 +675,9 @@ def test_national_dip_alignment():
     assert not any(k.startswith("AUX|TB|") for k in keys), \
         "加载国家目录库后结核不应再出现描述性键"
 
-    # ③ 烧伤：xlsx 无函5016-5039 → 保持降级键
-    assert "AUX|BURN|成人|Ⅱ度|10-19%" in keys
+    # ③ 烧伤：自包含《函》24 组 → 直出条目号 DIP 编码（不依赖 xlsx）
+    assert "5025" in keys, "烧伤应直出条目号 5025"
+    assert getattr(groups["5025"], "national_matched", False) is True
 
     # 对照：基本规则不受影响
     assert "K35|47.0100|" in keys
