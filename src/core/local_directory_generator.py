@@ -24,6 +24,25 @@ from ..utils.paths import get_data_dir, get_output_dir
 class LocalDirectoryGenerator:
     """本地目录库生成器"""
 
+    # 核心病种四层成组顺序（DIP3.0 规范）：本地目录库测算严格按此顺序成组与输出
+    #   先期分组(①) → 并项规则(②) → 诊断辅助细分(③) → 基本规则(④)
+    # 综合病种为第二阶段，单列于最后。
+    LAYER_ORDER = {
+        "先期分组": 0,
+        "并项规则": 1,
+        "诊断辅助细分": 2,
+        "基本规则": 3,
+        "综合病种": 4,
+    }
+
+    @staticmethod
+    def _layer_sort_key(g) -> Tuple[int, int, str]:
+        """本地目录库输出的四层排序键：先期→并项→诊断辅助细分→基本规则→综合病种；
+        同层内按病例数降序、病种代码升序，保证结果稳定可读。"""
+        layer = getattr(g, "grouping_layer", "")
+        order = LocalDirectoryGenerator.LAYER_ORDER.get(layer, 9)
+        return (order, -getattr(g, "case_count", 0), getattr(g, "disease_code", ""))
+
     # ---- 核心病种成组·范围与字典常量（《DIP3.0版分组征求地方意见的函》） ----
     # ③ 诊断辅助细分·肿瘤其他诊断允许类目
     #    允许范围: C00-C75 / C76-C80 / C81-C86 / C88 / C90 / C91-C95（不含 D00-D48 / C87 / C89 / C97）
@@ -1018,12 +1037,14 @@ class LocalDirectoryGenerator:
         age: int = 0,
         birth_date: str = "",
         admission_date: str = "",
-    ) -> str:
+    ) -> Tuple[str, str]:
         """核心病种成组键（DIP3.0 规范四层顺序）。
 
-        顺序：① 先期分组 → ② 并项规则 → ③ 诊断辅助细分（第三步，暂占位）
-              → ④ 基本规则（兜底）。
-        返回用于初级聚类的核心成组键。
+        返回 (成组键, 成组层次)。成组层次 ∈ 先期分组/并项规则/诊断辅助细分/基本规则，
+        用于本地目录库严格按 ①→②→③→④ 顺序成组与输出排序。
+
+        顺序：① 先期分组 → ② 并项规则 → ③ 诊断辅助细分 → ④ 基本规则（兜底）。
+        每条记录仅命中最高优先级的一层，得到唯一成组键（与后续测算顺序一致）。
 
         ① 先期分组：器官移植 / 呼吸循环支持 / 低出生体重儿等，多不区分主要诊断，
            依靠主要手术操作（见 _detect_priority）。
@@ -1031,7 +1052,9 @@ class LocalDirectoryGenerator:
            - 诊断并项：指定诊断族在 3 位码下归并（如心绞痛 I20.x -> I20）；
            - 手操并项（诊断维度）：指定诊断下忽略具体术式整体并项（如 D18.0 血管瘤）；
            - 手操并项（术式维度）：个体术式 -> 规范并项码（如肾动脉支架+球囊联合）。
-        ③ 诊断辅助细分（烧伤/肿瘤/结核）：按用户约定留待「第三步」实现，现透传基本规则。
+        ③ 诊断辅助细分（肿瘤放化疗靶向免疫 / 结核耐药 / 烧伤）：
+           与第三步「触发式辅助分型」(严重程度/年龄/ICU/CCI) 机制/阶段/字段/输出均不同，
+           此处仅做核心病种成组层细分，产出独立核心病种组（各自 RW）。
         ④ 基本规则：主要诊断 4 位码 + 主要手术操作（+ 相关手术操作）。
         """
         diag4 = self._extract_icd4(main_diag_code)
@@ -1043,22 +1066,28 @@ class LocalDirectoryGenerator:
             day_age, birth_weight, age, birth_date, admission_date,
         )
         if pri is not None:
-            return pri
+            return pri, "先期分组"
 
         # ② 并项规则
-        # 2a 诊断并项：指定诊断族用 3 位码归并
-        diag_key = diag3 if diag3 in self._merge_diag_families else diag4
+        # 2a 诊断并项：指定诊断族用 3 位码归并（命中即属并项规则层）
+        if diag3 in self._merge_diag_families:
+            diag_key = diag3
+            if main_oprn_code:
+                return (f"{diag_key}|{main_oprn_code}|{related_oprn_code}"
+                        if related_oprn_code else f"{diag_key}|{main_oprn_code}|"), "并项规则"
+            return f"{diag_key}||", "并项规则"
+        diag_key = diag4
         # 2b 手操并项（诊断维度）：指定诊断下整体并项，忽略具体术式
         if self._clean_str(main_diag_code).upper() in self._op_merge_diag_set:
-            return f"{diag4}|OPMERGE"
+            return f"{diag4}|OPMERGE", "并项规则"
         # 2c 手操并项（术式维度）：个体术式 -> 规范并项码（联合/相似并项，忽略相关手术）
         main_canon = self._op_merge_map.get(self._norm_op_code(main_oprn_code))
         rel_canon = self._op_merge_map.get(self._norm_op_code(related_oprn_code))
         if main_canon is not None or rel_canon is not None:
             canon = main_canon or rel_canon
-            return f"{diag_key}|{canon}|"
+            return f"{diag_key}|{canon}|", "并项规则"
 
-        # ③ 诊断辅助细分（肿瘤放化疗靶向免疫 / 结核耐药）
+        # ③ 诊断辅助细分（肿瘤放化疗靶向免疫 / 结核耐药 / 烧伤）
         #   与第三步「触发式辅助分型」(严重程度/年龄/ICU/CCI) 机制/阶段/字段/输出均不同，
         #   此处仅做核心病种成组层细分，产出独立核心病种组（各自 RW）。
         aux = self._refine_diagnostic_auxiliary(
@@ -1066,14 +1095,14 @@ class LocalDirectoryGenerator:
             age=age, day_age=day_age, birth_date=birth_date, admission_date=admission_date,
         )
         if aux is not None:
-            return aux
+            return aux, "诊断辅助细分"
 
         # ④ 基本规则（兜底）
         if main_oprn_code:
             if related_oprn_code:
-                return f"{diag_key}|{main_oprn_code}|{related_oprn_code}"
-            return f"{diag_key}|{main_oprn_code}|"
-        return f"{diag_key}||"
+                return f"{diag_key}|{main_oprn_code}|{related_oprn_code}", "基本规则"
+            return f"{diag_key}|{main_oprn_code}|", "基本规则"
+        return f"{diag_key}||", "基本规则"
 
     # ======================================================================
     # ③ 诊断辅助细分（独立于第三步「触发式辅助分型」）
@@ -1241,8 +1270,9 @@ class LocalDirectoryGenerator:
         group_type: GroupType,
         mixed_subtype: str,
         records: List[Dict] = None,
+        layer: str = "",
     ) -> DiseaseGroup:
-        """从聚合统计构造 DiseaseGroup（含 CCI / 严重度 / 裁剪 / 类别字段）。"""
+        """从聚合统计构造 DiseaseGroup（含 CCI / 严重度 / 裁剪 / 类别 / 成组层次 字段）。"""
         group = DiseaseGroup(
             disease_code=key.replace('|', '_'),
             disease_name=self._generate_disease_name(stats),
@@ -1264,6 +1294,7 @@ class LocalDirectoryGenerator:
             # 成组逻辑字段
             op_category=self._get_op_category(stats.get('main_oprn_code', '')),
             mixed_subtype=mixed_subtype,
+            grouping_layer=layer,
             member_records=records or [],
         )
         # 组级查字典：CCI 评分 + 疾病严重程度（规范逻辑，字典为权威数据源）
@@ -1282,17 +1313,19 @@ class LocalDirectoryGenerator:
         """
         将清单数据聚类为病种组合（本地目录库成组逻辑）
 
-        成组流程（DIP3.0 技术规范）：
-          一、核心病种：按「主要诊断 4 位码 + 主要手术操作（+ 相关手术操作）」
-             基本规则聚类，组内病例数 >= 地方临界值(threshold) 的依次形成地方
+        成组流程（DIP3.0 技术规范），严格按四层顺序测算：
+          一、核心病种：每条记录依次经 ① 先期分组 → ② 并项规则 →
+             ③ 诊断辅助细分 → ④ 基本规则（兜底）四层判定，仅命中最高优先级的一层，
+             得到唯一核心成组键；组内病例数 >= 地方临界值(threshold) 的依次形成地方
              核心病种（与国家目录库对照、顺序一致）。
-             （先期分组 / 并项规则 / 诊断辅助细分 三层见 _refine_core_group_key TODO）
           二、综合病种：未达到核心病种临界值的病例，按手术操作属性分 4 子组
              （内科诊疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组），
              叠加主诊断 3 位码类目聚类，并做质量控制（剔除仍低于阈值者、
              标记组内变异系数过高的组）。
          三、各组住院总费用做极端病例裁剪（2.5% / 97.5% 分位数），
              裁剪后有效病例数用于后续次均费用与 RW 测算。
+         四、最终本地目录库输出严格按 ①先期→②并项→③诊断辅助细分→④基本规则→综合病种
+             顺序排列（见 _layer_sort_key）。
 
         Args:
             df: 医保清单数据DataFrame
@@ -1307,11 +1340,12 @@ class LocalDirectoryGenerator:
         self.total_trimmed_cases = 0
         self.excluded_cases = 0
 
-        # ---------- 第一阶段：核心病种初级聚类（基本规则层） ----------
+        # ---------- 第一阶段：核心病种初级聚类（四层顺序成组） ----------
         primary = defaultdict(lambda: {
             'case_count': 0,
             'costs': [],                       # 逐条住院总费用，用于组内极端病例裁剪
             'records': [],                     # 逐条成员记录（含分型所需字段），供辅助分型使用
+            'layer': '',                       # 成组层次（先期分组/并项规则/诊断辅助细分/基本规则）
             'main_diag_code': '',
             'main_diag_name': '',
             'main_oprn_code': '',
@@ -1336,8 +1370,9 @@ class LocalDirectoryGenerator:
             if not main_diag:
                 continue
 
-            # 可插拔：先期分组 / 并项规则 / 诊断辅助细分
-            cluster_key = self._refine_core_group_key(
+            # 四层顺序成组：先期分组 → 并项规则 → 诊断辅助细分 → 基本规则
+            # （每条记录仅命中最高优先级一层，得到唯一 core 成组键 + 成组层次）
+            cluster_key, layer = self._refine_core_group_key(
                 main_diag, main_oprn, related_oprn, related_diag,
                 day_age=day_age, birth_weight=birth_weight, age=age,
                 birth_date=birth_date, admission_date=admission_date,
@@ -1346,6 +1381,7 @@ class LocalDirectoryGenerator:
             cost = Decimal(str(row.get('total_cost', 0)))
             stats = primary[cluster_key]
             stats['case_count'] += 1
+            stats['layer'] = layer
             stats['costs'].append(cost)
             # 保留成员记录供辅助分型逐条判定（住院天数/年龄/费用拆分/次要诊断/ICU/出院状态）
             stats['records'].append({
@@ -1397,7 +1433,7 @@ class LocalDirectoryGenerator:
                     key=key, stats=stats, case_count=case_count, avg_cost=avg_cost,
                     kept_count=kept_count, lb=lb, ub=ub, trimmed=trimmed,
                     group_type=GroupType.CORE, mixed_subtype="",
-                    records=stats['records'],
+                    records=stats['records'], layer=stats['layer'],
                 )
                 groups[key] = group
             else:
@@ -1457,6 +1493,7 @@ class LocalDirectoryGenerator:
                 key=f"MIX_{subtype}_{diag3}", stats=stats, case_count=case_count,
                 avg_cost=avg_cost, kept_count=kept_count, lb=lb, ub=ub, trimmed=trimmed,
                 group_type=GroupType.MIXED, mixed_subtype=subtype,
+                layer="综合病种",
             )
 
             # 综合病种质量控制：
@@ -1708,6 +1745,7 @@ class LocalDirectoryGenerator:
             trim_lower_bound=lb, trim_upper_bound=ub, trim_count=trimmed,
             op_category=parent.op_category,
             mixed_subtype="",
+            grouping_layer=parent.grouping_layer,
             member_records=members,
             auxiliary_type=dimension,
             auxiliary_level=level,
@@ -1982,9 +2020,10 @@ class LocalDirectoryGenerator:
         merged_mixed = self.merge_mixed_groups(mixed_groups)
         print(f"   合并后综合病种: {len(merged_mixed)} 个")
         
-        # 6. 计算分值
+        # 6. 计算分值（本地目录库严格按 ①先期→②并项→③诊断辅助细分→④基本规则→综合病种 顺序排列）
         print("\n[6/6] 计算病种分值...")
         all_groups = core_groups + merged_mixed
+        all_groups = sorted(all_groups, key=self._layer_sort_key)
         all_groups = self.calculate_all_disease_values(all_groups)
         
         # 与国家目录库匹配
@@ -2037,13 +2076,15 @@ class LocalDirectoryGenerator:
         return str(full_path)
     
     def _export_full_directory(self, groups: List[DiseaseGroup]) -> pd.DataFrame:
-        """导出完整目录库"""
+        """导出完整目录库（严格按 ①先期→②并项→③诊断辅助细分→④基本规则→综合病种 顺序排列）"""
+        ordered = sorted(groups, key=self._layer_sort_key)
         data = []
-        for i, group in enumerate(groups, 1):
+        for i, group in enumerate(ordered, 1):
             data.append({
                 '序号': i,
                 'DIP病种代码': group.disease_code,
                 'DIP病种名称': group.disease_name,
+                '分组层次': group.grouping_layer,
                 '主要诊断代码': group.main_diag_code,
                 '主要诊断名称': group.main_diag_name,
                 '主要手术操作代码': group.main_oprn_code,
@@ -2074,13 +2115,15 @@ class LocalDirectoryGenerator:
         return pd.DataFrame(data)
 
     def _export_core_directory(self, groups: List[DiseaseGroup]) -> pd.DataFrame:
-        """导出核心病种目录"""
+        """导出核心病种目录（严格按 ①先期→②并项→③诊断辅助细分→④基本规则 顺序排列）"""
+        ordered = sorted(groups, key=self._layer_sort_key)
         data = []
-        for i, group in enumerate(groups, 1):
+        for i, group in enumerate(ordered, 1):
             data.append({
                 '序号': i,
                 'DIP病种代码': group.disease_code,
                 'DIP病种名称': group.disease_name,
+                '分组层次': group.grouping_layer,
                 '主要诊断代码': group.main_diag_code,
                 '主要诊断名称': group.main_diag_name,
                 '主要手术操作代码': group.main_oprn_code,

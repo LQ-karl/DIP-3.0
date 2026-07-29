@@ -36,6 +36,19 @@ class GroupType(Enum):
     ADVANCED = "先期分组"
 
 
+class GroupLayer(Enum):
+    """核心病种四层成组层次（DIP3.0 规范顺序，用于本地目录库测算排序与标注）
+
+    顺序：先期分组(①) → 并项规则(②) → 诊断辅助细分(③) → 基本规则(④)；
+    综合病种为第二阶段，单列于最后。
+    """
+    PRIORITY = "先期分组"
+    MERGE = "并项规则"
+    DIAG_AUX = "诊断辅助细分"
+    BASIC = "基本规则"
+    MIXED = "综合病种"
+
+
 class CalculationMethod(Enum):
     """分值计算方法"""
     AVERAGE_COST = "平均费用法"
@@ -85,6 +98,7 @@ class DiseaseGroup:
     # 综合病种子组：内科诊疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组
     mixed_subtype: str = ""        # 综合病种子组类型（核心病种此列为空）
     op_category: str = ""          # 主手术操作类别（手术/治疗性操作/诊断性操作/介入治疗/无）
+    grouping_layer: str = ""       # 成组层次（先期分组/并项规则/诊断辅助细分/基本规则/综合病种）
 
     # 国家目录库匹配
     national_dip_code: str = ""    # 匹配到的国家目录库 DIP 编码

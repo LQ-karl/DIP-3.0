@@ -677,6 +677,81 @@ def test_national_dip_alignment():
     assert "K35|47.0100|" in keys
 
 
+def test_grouping_layer_order():
+    """本地目录库测算严格按 ①先期→②并项→③诊断辅助细分→④基本规则→综合病种 顺序成组与输出。
+
+    覆盖：
+      - 每条记录仅命中最高优先级的一层，得到唯一成组键 + 成组层次标注；
+      - 核心病种输出顺序为 先期分组 → 并项规则 → 诊断辅助细分 → 基本规则；
+      - 完整目录中综合病种单列于四层核心病种之后；
+      - 导出 DataFrame 的「分组层次」列严格非降排列。
+    """
+    rows = []
+
+    def add(dx, op="", relop="", reldx="", n=3, **extra):
+        for _ in range(n):
+            row = {
+                "main_diag_code": dx, "main_diag_name": "",
+                "main_oprn_code": op, "main_oprn_name": "",
+                "related_oprn_code": relop, "related_oprn_name": "",
+                "related_diag_code": reldx,
+                "total_cost": 10000,
+                "day_age": 0, "birth_weight": 0, "age": 0,
+                "los": 5, "icu_days": 0, "discharge_status": "1",
+            }
+            row.update(extra)
+            rows.append(row)
+
+    # ① 先期分组：低出生体重（天龄10天，出生体重1400g）
+    add("P07.1", n=3, **{"day_age": 10, "birth_weight": 1400})
+    # ① 先期分组：器官移植（肾移植 55.6）
+    add("N18.5", op="55.6", n=3)
+    # ② 并项规则：诊断并项（心绞痛 I20.x → 3 位码归并）
+    add("I20.0", n=3)
+    # ③ 诊断辅助细分：肿瘤放化疗（未加载国家目录→描述性键，但层次仍为诊断辅助细分）
+    add("Z51.1", relop="99.2503", reldx="C80", n=3)
+    # ④ 基本规则：普通手术（阑尾炎 + 阑尾切除）
+    add("K35.8", op="47.0", n=3)
+    # 综合病种：未达阈值的低频病种（1 例）
+    add("Q89.9", op="", n=1)
+
+    df = pd.DataFrame(rows)
+    gen = LocalDirectoryGenerator(threshold=2)
+    groups = gen.cluster_records_to_groups(df)
+
+    # 1) 每个核心病种都应带有四层之一的成组层次标注
+    valid_layers = {"先期分组", "并项规则", "诊断辅助细分", "基本规则"}
+    for k, g in groups.items():
+        if g.group_type.value == "核心病种":
+            assert g.grouping_layer in valid_layers, \
+                f"核心病种 {k} 成组层次缺失或非法: {g.grouping_layer!r}"
+
+    core = [g for g in groups.values() if g.group_type.value == "核心病种"]
+    mixed = [g for g in groups.values() if g.group_type.value == "综合病种"]
+    assert mixed, "应存在综合病种（未达阈值）"
+    assert {g.grouping_layer for g in core} == valid_layers, \
+        f"四层核心病种应齐全，实际: {sorted(set(g.grouping_layer for g in core))}"
+
+    # 2) 核心病种按四层顺序输出（先期→并项→诊断辅助细分→基本规则）
+    core_order = [g.grouping_layer for g in sorted(core, key=gen._layer_sort_key)]
+    assert core_order == sorted(core_order, key=lambda L: gen.LAYER_ORDER[L]), \
+        f"核心病种输出顺序不符合四层顺序: {core_order}"
+
+    # 3) 导出核心病种目录：分组层次列严格非降
+    core_df = gen._export_core_directory(core)
+    layer_seq = core_df["分组层次"].tolist()
+    assert layer_seq == sorted(layer_seq, key=lambda L: gen.LAYER_ORDER.get(L, 9)), \
+        f"核心病种目录分组层次未按四层顺序排列: {layer_seq}"
+
+    # 4) 完整目录：综合病种排在四层核心病种之后
+    full_df = gen._export_full_directory(list(groups.values()))
+    layers_full = full_df["分组层次"].tolist()
+    assert layers_full == sorted(layers_full, key=lambda L: gen.LAYER_ORDER.get(L, 9)), \
+        f"完整目录未按 四层+综合 顺序排列: {layers_full}"
+    assert layers_full[-len(mixed):] == ["综合病种"] * len(mixed), \
+        "综合病种应排在所有核心病种之后"
+
+
 if __name__ == "__main__":
     test_local_directory_generation()
     test_extreme_case_trimming()
@@ -685,6 +760,7 @@ if __name__ == "__main__":
     test_auxiliary_typing()
     test_diagnostic_auxiliary_subdivision()
     test_national_dip_alignment()
-    print("test_local_directory.py 全部 7 个用例通过")
+    test_grouping_layer_order()
+    print("test_local_directory.py 全部 8 个用例通过")
 
 
