@@ -587,6 +587,96 @@ def test_diagnostic_auxiliary_subdivision():
     assert len(aux_keys) == 13, f"③ 应恰好 13 个 AUX 组，实际 {aux_keys}"
 
 
+def test_national_dip_alignment():
+    """①/③ 严格对齐国家目录库（DIP3.0版分组征求地方意见的函）。
+
+    加载 DIP3.0国家目录库.xlsx 后：
+      ① 低出生体重(函4969-4973)：天龄≤28天 + 出生体重 → 直接产出国家 DIP 编码
+         P07-01(<750g)/P07-02(750-999)/P07-03(1000-1499)/P07-04(1500-1999)/P07-05(2000-2499)
+      ③ 肿瘤(函4974-5015)：Z51.1/Z51.8 × C范围(6档) × 治疗组合(7种) → Z51.x-NN
+      ③ 结核(函5040-5061)：A15-A16/A17/A18/A19 × 术式组 × 耐药 → A15-A16-NN 等
+      ③ 烧伤(函5016-5039)：xlsx 导出截断缺失该段 → 保持 AUX|BURN 降级键
+    未加载国家目录库时仍走描述性键（由前两个用例覆盖，向后兼容）。
+    """
+    rows = []
+
+    def add(dx, op="", relop="", reldx="", n=1, **extra):
+        for _ in range(n):
+            row = {
+                "主要诊断代码": dx, "主要诊断名称": "",
+                "主要手术操作代码": op, "主要手术操作名称": "",
+                "相关手术操作代码": relop, "相关手术操作名称": "",
+                "相关诊断代码": reldx,
+                "医疗总费用": 10000,
+            }
+            row.update(extra)
+            rows.append(row)
+
+    # ① 低出生体重：三个体重档
+    add("P07.0", **{"天龄": 10, "出生体重": 1400})   # 极低 → P07-03
+    add("P07.0", **{"天龄": 3, "出生体重": 800})     # 超低 → P07-02
+    add("P07.1", **{"天龄": 20, "出生体重": 2300})   # 低 → P07-05
+    # ①-负例：天龄>28天 不进先期 → 基本规则
+    add("P07.0", **{"天龄": 40, "出生体重": 1400})
+    # ③ 肿瘤：DIP 编码 = 主诊断 × C范围 × 治疗组合
+    add("Z51.1", relop="99.2503", reldx="C80")                              # → Z51.1-23
+    add("Z51.1", relop="99.2503+99.2800x006+99.2800x005", reldx="C91")      # → Z51.1-42
+    add("Z51.8", relop="99.2800x005", reldx="C90")                          # → Z51.8-40
+    add("Z51.8", relop="99.2800x006+99.2800x005", reldx="C81")              # → Z51.8-36
+    # ③-肿瘤降级：无治疗操作 → 国家库无对应行，保持描述性键
+    add("Z51.1", reldx="C80")
+    # ③ 结核：耐药标志 × 术式组
+    add("A15.1")                                    # 非耐药无术式 → A15-A16-00
+    add("A16", reldx="U84.300")                     # 耐药(U84.300) → A15-A16-02
+    add("A15.000x010")                              # 耐药(主诊断拓展码) → A15-A16-02
+    add("A17", reldx="U84.300")                     # → A17-02
+    add("A15.1", op="34.0401")                      # 非耐药+胸廓成形术 → A15-A16-12
+    # ③ 烧伤：xlsx 缺函5016-5039 段 → 应保持 AUX|BURN 降级键
+    add("T30.2", reldx="T31.1", **{"年龄": 35})
+    # 对照：普通病种走基本规则
+    add("K35.9", op="47.0100", n=2)
+
+    df = pd.DataFrame(rows)
+    gen = LocalDirectoryGenerator(threshold=1)
+    gen.load_national_directory("F:/DIP/data/DIP3.0国家目录库.xlsx")
+    groups = gen.cluster_records_to_groups(df)
+    keys = list(groups.keys())
+
+    # ① 低出生体重 → 国家 DIP 编码直出
+    for dip in ("P07-02", "P07-03", "P07-05"):
+        assert dip in keys, f"低出生体重应产出国家编码 {dip}，实际 {sorted(keys)}"
+        assert getattr(groups[dip], "national_matched", False) is True, \
+            f"{dip} 应标记 national_matched"
+        assert getattr(groups[dip], "national_dip_code", None) == dip
+    assert not any(k.startswith("PRI|LBW|") for k in keys), \
+        "加载国家目录库后不应再出现描述性 LBW 键"
+    # ①-负例：天龄40天 → 基本规则(P07 开头)
+    assert any(k.startswith("P07|") for k in keys), "超28天新生儿应走基本规则"
+
+    # ③ 肿瘤 → 国家 DIP 编码直出
+    for dip in ("Z51.1-23", "Z51.1-42", "Z51.8-40", "Z51.8-36"):
+        assert dip in keys, f"肿瘤细分应产出国家编码 {dip}，实际 {sorted(keys)}"
+        assert getattr(groups[dip], "national_matched", False) is True
+    # ③-肿瘤降级：无治疗操作组合在国家库无行 → 描述性键
+    assert "AUX|TUMOR|C80|其他" in keys, "无治疗操作应降级为描述性键"
+
+    # ③ 结核 → 国家 DIP 编码直出
+    assert "A15-A16-00" in keys
+    assert "A15-A16-02" in keys
+    assert groups["A15-A16-02"].case_count == 2, \
+        f"U84.300 与主诊断拓展码应并入 A15-A16-02(2例)，实际 {groups['A15-A16-02'].case_count}"
+    assert "A17-02" in keys
+    assert "A15-A16-12" in keys, f"胸廓成形术应命中 A15-A16-12，实际 {sorted(keys)}"
+    assert not any(k.startswith("AUX|TB|") for k in keys), \
+        "加载国家目录库后结核不应再出现描述性键"
+
+    # ③ 烧伤：xlsx 无函5016-5039 → 保持降级键
+    assert "AUX|BURN|成人|Ⅱ度|10-19%" in keys
+
+    # 对照：基本规则不受影响
+    assert "K35|47.0100|" in keys
+
+
 if __name__ == "__main__":
     test_local_directory_generation()
     test_extreme_case_trimming()
@@ -594,6 +684,7 @@ if __name__ == "__main__":
     test_core_disease_priority_and_merge()
     test_auxiliary_typing()
     test_diagnostic_auxiliary_subdivision()
-    print("test_local_directory.py 全部 6 个用例通过")
+    test_national_dip_alignment()
+    print("test_local_directory.py 全部 7 个用例通过")
 
 

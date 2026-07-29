@@ -301,8 +301,76 @@ class LocalDirectoryGenerator:
             raise ValueError(f"不支持的文件格式: {file_path}")
         
         self.national_directory = df
+        self._build_national_lookups(df)
         print(f"已加载国家目录库: {len(df)} 条记录")
         return df
+
+    def _build_national_lookups(self, df: pd.DataFrame):
+        """从国家目录库解析 ①/③ 特殊组的权威 DIP 编码映射，供成组时严格对齐。
+
+        仅解析《函》明确的三类先期/诊断辅助细分行：
+          - 低出生体重先期(P07-01..05)：按 出生体重 分档
+          - 肿瘤诊断辅助细分(Z51.1/Z51.8)：按 (主诊断, C范围, 治疗码) 唯一映射
+          - 结核诊断辅助细分(A15-A16/A17/A18/A19)：按 (类目, 主手术集, 耐药) 唯一映射
+        其余行（普通核心/综合病种）用于 match_with_national_directory 的通用回写。
+        """
+        self._nat_dip_codes: set = set()
+        self._nat_rows_by_dip: Dict[str, dict] = {}
+        for _, r in df.iterrows():
+            dip = str(r.get('DIP编码', '')).strip()
+            if dip.lower() == 'nan' or not dip:
+                continue
+            self._nat_dip_codes.add(dip)
+            self._nat_rows_by_dip[dip] = r.to_dict()
+
+        # ---- 低出生体重先期(P07-01..05) ----
+        self._nat_lbw: List[dict] = []
+        for _, r in df.iterrows():
+            if str(r.get('主要诊断编码', '')).strip() != 'P07':
+                continue
+            if '出生体重' not in str(r.get('主要诊断名称', '')):
+                continue
+            wt = str(r.get('相关手术操作编码', '') or '')
+            m_dash = re.search(r'(\d+)\s*-\s*(\d+)', wt)
+            if m_dash:
+                lo, hi = int(m_dash.group(1)), int(m_dash.group(2)) + 1
+            else:
+                m_lt = re.search(r'<\s*(\d+)', wt)
+                if not m_lt:
+                    continue
+                lo, hi = 0, int(m_lt.group(1)) + 1
+            self._nat_lbw.append({'dip': str(r['DIP编码']).strip(), 'lo': lo, 'hi': hi})
+
+        # ---- 肿瘤诊断辅助细分(Z51.1/Z51.8，主要手术操作列放 C 范围、相关列放治疗组合) ----
+        self._nat_tumor: Dict[Tuple[str, str, str], str] = {}
+        for _, r in df.iterrows():
+            md = str(r.get('主要诊断编码', '')).strip()
+            if md not in ('Z51.1', 'Z51.8'):
+                continue
+            c = str(r.get('主要手术操作编码', '') or '').strip()
+            if not c.startswith('C'):
+                continue
+            t = re.sub(r'^[^0-9]*', '', str(r.get('相关手术操作编码', '') or '').strip().replace(' ', ''))
+            self._nat_tumor[(md, c, t)] = str(r['DIP编码']).strip()
+
+        # ---- 结核诊断辅助细分(A15-A16/A17/A18/A19) ----
+        self._nat_tb: Dict[Tuple[str, tuple, bool], str] = {}
+        self._nat_tb_ops: Dict[str, List[tuple]] = {}
+        for _, r in df.iterrows():
+            md = str(r.get('主要诊断编码', '')).strip()
+            if md not in ('A15-A16', 'A17', 'A18', 'A19'):
+                continue
+            raw_op = r.get('主要手术操作编码', '')
+            op = '' if (raw_op is None or str(raw_op).strip().lower() == 'nan') else str(raw_op).strip()
+            op_set = tuple(sorted(x.upper().replace(' ', '') for x in re.split(r'[| ]+', op) if x)) if op else ()
+            # 结核耐药标志位于「相关手术操作编码」列（值为 否/是），而非名称列
+            raw_relop = r.get('相关手术操作编码', '')
+            rel_flag = '' if (raw_relop is None or str(raw_relop).strip().lower() == 'nan') else str(raw_relop).strip()
+            resistant = (rel_flag == '是')
+            dip = str(r['DIP编码']).strip()
+            self._nat_tb[(md, op_set, resistant)] = dip
+            if op_set not in self._nat_tb_ops.setdefault(md, []):
+                self._nat_tb_ops[md].append(op_set)
     
     def load_hospital_settlement_data(self, file_path: str) -> pd.DataFrame:
         """
@@ -664,9 +732,15 @@ class LocalDirectoryGenerator:
         # 避免与 ③ 烧伤等婴儿病种冲突（正常体重婴儿不占先期分组）。
         if self._is_under_one_year(age, day_age, birth_date, admission_date):
             if Decimal("0") < birth_weight < Decimal(str(self.LBW_BIRTH_WEIGHT_THRESHOLD)):
-                age_bucket = "新生儿期" if (day_age or 0) <= 28 else "婴儿期"
-                weight_bucket = self._lbw_weight_bucket(birth_weight)
-                return f"PRI|LBW|{age_bucket}|{weight_bucket}"
+                # 对齐国家目录库先期 LBW：仅 <29天(≤28天) 进入，按出生体重档位取权威 DIP 码
+                days = self._age_in_days(day_age, birth_date, admission_date)
+                if days is not None and days <= 28:
+                    if getattr(self, 'national_directory', None) is not None and getattr(self, '_nat_lbw', None):
+                        dip = self._lbw_dip_for(birth_weight)
+                        if dip:
+                            return dip
+                    weight_bucket = self._lbw_weight_bucket(birth_weight)
+                    return f"PRI|LBW|新生儿期|{weight_bucket}"
 
         return None
 
@@ -740,6 +814,107 @@ class LocalDirectoryGenerator:
         except Exception:
             pass
         return 0
+
+    @staticmethod
+    def _age_in_days(day_age, birth_date, admission_date):
+        """推算年龄(天)；优先天龄，其次 出生日期+入院时间 之差；无法判定返回 None。"""
+        try:
+            if int(day_age or 0) > 0:
+                return int(day_age)
+        except Exception:
+            pass
+        import datetime
+        bd = LocalDirectoryGenerator._clean_str(birth_date)
+        ad = LocalDirectoryGenerator._clean_str(admission_date)
+        if bd and ad:
+            try:
+                b = datetime.datetime.strptime(bd[:10], "%Y-%m-%d")
+                a = datetime.datetime.strptime(ad[:10], "%Y-%m-%d")
+                d = (a - b).days
+                if d >= 0:
+                    return d
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _c_code_to_range(c3: str) -> str:
+        """3 位 C 码 → 国家目录肿瘤 C 范围标签（C00-C75/C76-C80/C81-C86/C88/C90/C91-C95）。"""
+        if not (len(c3) >= 3 and c3[0] == 'C' and c3[1:3].isdigit()):
+            return ""
+        n = int(c3[1:3])
+        if 0 <= n <= 75:
+            return "C00-C75"
+        if 76 <= n <= 80:
+            return "C76-C80"
+        if 81 <= n <= 86:
+            return "C81-C86"
+        if n == 88:
+            return "C88"
+        if n == 90:
+            return "C90"
+        if 91 <= n <= 95:
+            return "C91-C95"
+        return ""
+
+    @staticmethod
+    def _treatment_tag_to_code(tag: str) -> str:
+        """治疗方式中文标签 → 国家目录手术操作码（化疗/靶向/免疫 组合）。"""
+        return {
+            "免疫": "99.2800x005",
+            "化疗": "99.2503",
+            "化疗+免疫": "99.2503+99.2800x005",
+            "化疗+靶向": "99.2503+99.2800x006",
+            "化疗+靶向+免疫": "99.2503+99.2800x006+99.2800x005",
+            "靶向": "99.2800x006",
+            "靶向+免疫": "99.2800x006+99.2800x005",
+        }.get(tag, "")
+
+    def _tumor_dip_for(self, main_diag, neo3, main_oprn, related_oprn) -> str:
+        """反查肿瘤诊断辅助细分 DIP 码（(主诊断, C范围, 治疗码) → Z51.1/Z51.8-XX）。"""
+        c_range = LocalDirectoryGenerator._c_code_to_range(neo3)
+        if not c_range:
+            return ""
+        tag = self._tumor_treatment_tag(main_oprn, related_oprn)
+        code = LocalDirectoryGenerator._treatment_tag_to_code(tag)
+        if not code:
+            return ""
+        main_z = "Z51.1" if self._clean_str(main_diag).upper().startswith("Z51.1") else "Z51.8"
+        return self._nat_tumor.get((main_z, c_range, code), "")
+
+    def _lbw_dip_for(self, birth_weight) -> str:
+        """按出生体重(g)反查国家目录低出生体重先期 DIP 码(P07-01..05)。"""
+        if not getattr(self, '_nat_lbw', None):
+            return ""
+        try:
+            w = float(birth_weight)
+        except Exception:
+            return ""
+        for b in self._nat_lbw:
+            if b['lo'] <= w < b['hi']:
+                return b['dip']
+        return ""
+
+    def _tb_op_set_for(self, cat, main_oprn, related_oprn):
+        """按病例手术码反查国家目录结核手术变体 op_set（A15-A16 7 种 / A17 含腰椎穿刺 / 其他无手术）。"""
+        codes = set()
+        for o in (self._split_codes(main_oprn) + self._split_codes(related_oprn)):
+            codes.add(o.upper().replace(' ', ''))
+        if not codes:
+            return ()
+        for op_set in self._nat_tb_ops.get(cat, []):
+            if any(c in op_set for c in codes):
+                return op_set
+        return ()  # 未落在任何具体术式变体 → 归入“无特定手术”空 op_set 组
+
+    def _tb_dip_for(self, cat, main_oprn, related_oprn, resistant) -> str:
+        """反查结核诊断辅助细分 DIP 码（A15-A16-00..13 / A17-00..03 / A18-00..01 / A19-00..01）。"""
+        op_set = self._tb_op_set_for(cat, main_oprn, related_oprn)
+        dip = self._nat_tb.get((cat, op_set, resistant))
+        if dip is None:
+            # 容错：该术式组合无对应耐药/非耐药行时，退而取同术式另一耐药态
+            dip = self._nat_tb.get((cat, op_set, not resistant), "")
+        return dip or ""
 
     def _get_op_category(self, insurance_op_code: str) -> str:
         """医保版手术码 -> 手术类别（手术/治疗性操作/诊断性操作/介入治疗/''）。"""
@@ -937,7 +1112,7 @@ class LocalDirectoryGenerator:
                 types.add("化疗")
             if "99.2800X006" in o:
                 types.add("靶向")
-            elif "99.2800X005" in o:
+            if "99.2800X005" in o:
                 types.add("免疫")
         if not types:
             return "其他"
@@ -1016,6 +1191,10 @@ class LocalDirectoryGenerator:
         if diag.startswith("Z51.1") or diag.startswith("Z51.8"):
             neo3 = self._neoplasm_category(related_diag_code)
             if neo3:
+                if getattr(self, 'national_directory', None) is not None and getattr(self, '_nat_tumor', None):
+                    dip = self._tumor_dip_for(diag, neo3, main_oprn_code, related_oprn_code)
+                    if dip:
+                        return dip
                 return f"AUX|TUMOR|{neo3}|{self._tumor_treatment_tag(main_oprn_code, related_oprn_code)}"
 
         # ---- (C) 烧伤类病种：先年龄，再 烧伤程度(T29/T30) + 面积(T31/T32) ----
@@ -1029,6 +1208,10 @@ class LocalDirectoryGenerator:
         if diag[:2] == "A1" and diag[:3] in ("A15", "A16", "A17", "A18", "A19"):
             cat = "A15-A16" if diag[:3] in ("A15", "A16") else diag[:3]
             resistant = self._is_tb_drug_resistant(diag, related_diag_code)
+            if getattr(self, 'national_directory', None) is not None and getattr(self, '_nat_tb', None):
+                dip = self._tb_dip_for(cat, main_oprn_code, related_oprn_code, resistant)
+                if dip:
+                    return dip
             return f"AUX|TB|{cat}|{'耐药' if resistant else '非耐药'}"
 
         return None
@@ -1089,6 +1272,10 @@ class LocalDirectoryGenerator:
         sev_level, sev_type = self._compute_group_severity(diags)
         group.severity_level = sev_level
         group.severity_type = sev_type
+        # ①/③ 严格对齐：若组键即国家目录 DIP 编码，直接回填权威码
+        if key in getattr(self, '_nat_dip_codes', set()):
+            group.national_dip_code = key
+            group.national_matched = True
         return group
 
     def cluster_records_to_groups(self, df: pd.DataFrame) -> Dict[str, DiseaseGroup]:
@@ -1667,6 +1854,33 @@ class LocalDirectoryGenerator:
         results = []
 
         for group in local_groups:
+            # ①/③ 组键已是权威 DIP 码（严格对齐国家目录）：直接确认匹配并回填目录字段
+            if group.disease_code in getattr(self, '_nat_dip_codes', set()):
+                group.national_matched = True
+                group.national_dip_code = group.disease_code
+                row = self._nat_rows_by_dip.get(group.disease_code, {})
+                results.append({
+                    '本地病种代码': group.disease_code,
+                    '本地病种名称': group.disease_name,
+                    '主要诊断代码': row.get('主要诊断编码', group.main_diag_code),
+                    '主要诊断名称': row.get('主要诊断名称', group.main_diag_name),
+                    '主要手术操作代码': row.get('主要手术操作编码', group.main_oprn_code),
+                    '主要手术操作名称': row.get('主要手术操作名称', group.main_oprn_name),
+                    '相关手术操作代码': row.get('相关手术操作编码', group.related_oprn_code),
+                    '相关手术操作名称': row.get('相关手术操作名称', group.related_oprn_name),
+                    '病例数': group.case_count,
+                    '次均费用': float(group.avg_cost),
+                    '病种分值': float(group.disease_value),
+                    'CCI评分': int(group.cci_score),
+                    '疾病严重程度': group.severity_level,
+                    '综合病种子组': group.mixed_subtype,
+                    '手术操作类别': group.op_category,
+                    '分组类型': group.group_type.value,
+                    '是否匹配国家目录': '是',
+                    '国家DIP编码': group.disease_code,
+                })
+                continue
+
             # 与国家目录库对照（按 主要诊断编码(4位) + 主要手术操作编码）
             # 本地核心病种主诊断已归并到 4 位码，与目录库口径一致
             group_diag4 = self._extract_icd4(group.main_diag_code)
