@@ -10,6 +10,7 @@ from collections import defaultdict
 from types import SimpleNamespace
 import json
 import re
+import os
 
 from ..models.models import DiseaseGroup, GroupType, MedicalRecord, CalculationMethod
 from ..core.grouping_engine import DIPGroupingEngine
@@ -71,11 +72,13 @@ class LocalDirectoryGenerator:
     # ③ 诊断辅助细分·烧伤（《函》序号 5016–5039，共 24 组，按 程度×面积×年龄 细分）
     # 《函》未给 DIP 编码列，此处按用户补充规则以《函》条目号作为权威编码。
     #   程度(degree_cat) ∈ {三度, 二度, 多部位三度, 多部位二度}
-    #     - 主诊断 T29.* → 多部位；T30.* → 单部位(身体部位未特指)
-    #     - 第4位深度码 → 程度桶：.1/.2 → 二度桶；.3/.5/.6/.7 → 三度桶
-    #   面积(area_cat) 由 年龄 决定分档（见 _burn_area_cat）：
-    #     - <18岁：10%以下 / 10%以上（T31/T32 第4位 0→以下, 1-9→以上）
-    #     - ≥18岁：10%以下 / 10%-20% / 20%-30% / 30%以上（T31/T32 第4位 0/1/2/3+）
+    #     - 主诊断 T29.*(多处/多部位) / T30.*(单部位)
+    #     - 程度判定：依据 ICD 名称中含的「一度/二度/三度」（名称从
+    #       《ICD10国临版2.0对照医保版2.0_0125》提取），**不使用编码第4位**；
+    #       一度烧伤《函》无对应组 → 不进入诊断辅助细分（回落基本规则 ④）
+    #   面积(area_cat)：依据 次要诊断 T31/T32 名称中含的「百分比区间」判定（同样不使用第4位）
+    #     - <18岁：10%以下 / 10%以上
+    #     - ≥18岁：10%以下 / 10%-20% / 20%-30% / 30%以上
     NAT_BURN_TABLE = [
         (5016, "三度", "<18岁", "10%以下"), (5017, "三度", "<18岁", "10%以上"),
         (5018, "三度", "≥18岁", "10%以下"), (5019, "三度", "≥18岁", "10%-20%"),
@@ -90,11 +93,6 @@ class LocalDirectoryGenerator:
         (5036, "多部位二度", "≥18岁", "10%以下"), (5037, "多部位二度", "≥18岁", "10%-20%"),
         (5038, "多部位二度", "≥18岁", "20%-30%"), (5039, "多部位二度", "≥18岁", "30%以上"),
     ]
-    # 第4位深度码 → 程度桶（对《函》二度/三度两类的合理归并；口径以用户校正为准）
-    BURN_DEGREE_BUCKET = {
-        "1": "二度", "2": "二度",
-        "3": "三度", "5": "三度", "6": "三度", "7": "三度",
-    }
     # 年龄分界（岁）：《函》烧伤 <18岁 / ≥18岁
     BURN_AGE_ADULT = 18
     # 先期分组·低出生体重判定阈值（g）：高于该值不属低出生体重，不进入先期分组
@@ -141,6 +139,11 @@ class LocalDirectoryGenerator:
         self.cci_prefix: Dict[str, int] = {}     # 3 位前缀 -> CCI 分数
         self.severity_entries: List[Dict] = []   # 中重度分型字典条目
         self._load_dictionaries()
+
+        # 烧伤程度/面积名称查表：从《ICD10国临版2.0对照医保版2.0_0125》提取名称，
+        # 用于按名称判定「一度/二度/三度」与「面积百分比」，而非编码第4位
+        self._burn_name_map: Dict[str, str] = {}
+        self._load_icd10_name_map()
 
         # 手术操作类别映射（综合病种四子组所需）
         # 国临版手术码 -> 类别（手术/治疗性操作/诊断性操作/介入治疗）
@@ -437,6 +440,65 @@ class LocalDirectoryGenerator:
                     '相关手术操作编码': '',
                     '相关手术操作名称': f'年龄{age_cat}，面积{area_cat}',
                 }
+
+    def _load_icd10_name_map(self) -> None:
+        """从《ICD10国临版2.0对照医保版2.0_0125》抽取 T29/T30/T31/T32 名称映射。
+
+        烧伤（③ 诊断辅助细分）程度/面积严格按 ICD *名称* 判定（用户明确要求：
+        使用名称中的「一度/二度/三度」与「百分比区间」，不使用编码第4位）：
+          - 程度：主诊断名称含 一度/二度/三度/四度；多处/多部位 → 多部位；
+          - 面积：次要诊断 T31/T32 名称含百分比区间（如 体表10-19% / 累及体表20%~29%）。
+        仅抽取烧伤相关(T29/T30/T31/T32)编码的 国临版名称与医保版2.0名称，
+        构建 code→name 查表（同时收纳两列编码，兼容清单用国临版或医保版码）。
+        """
+        fname = "ICD10国临版2.0对照医保版2.0_0125.xlsx"
+        path = os.path.join(self.data_dir, fname)
+        if not os.path.exists(path):
+            print(f"警告: 未找到 {fname}，烧伤程度/面积名称判定不可用(不进入诊断辅助细分)")
+            return
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            hdr = rows[0]
+            ci = {str(h): i for i, h in enumerate(hdr)}
+            c_cl, n_cl = ci.get("国临版编码"), ci.get("国临版名称")
+            c_im, n_im = ci.get("医保版2.0编码"), ci.get("医保版2.0名称")
+            for r in rows[1:]:
+                for col_c, col_n in ((c_cl, n_cl), (c_im, n_im)):
+                    if col_c is None or col_n is None:
+                        continue
+                    code = str(r[col_c] or "").strip().upper()
+                    name = str(r[col_n] or "").strip()
+                    if not code or not name:
+                        continue
+                    if code[:3] in ("T29", "T30", "T31", "T32"):
+                        # 国临版优先；同码两列同名时后者不覆盖；键统一大写以便不区分 x/X
+                        self._burn_name_map.setdefault(code, name)
+        except Exception as e:
+            print(f"警告: 加载 ICD10 名称映射失败，烧伤名称判定不可用: {e}")
+            return
+        print(f"已加载烧伤 ICD 名称映射: {len(self._burn_name_map)} 条(T29/T30/T31/T32)")
+
+    def _icd10_burn_name(self, code: str) -> str:
+        """按编码查烧伤相关 ICD 名称（兼容国临版/医保版码，并做前缀匹配）。
+
+        返回名称字符串；查不到返回空串。前缀匹配示例：T30.2 -> T30.200(二度烧伤)、
+        T29.300x001 -> T29.300(多处三度烧伤)。
+        """
+        code = self._clean_str(code).upper()
+        if not code:
+            return ""
+        if code in self._burn_name_map:
+            return self._burn_name_map[code]
+        prefix_hits = [k for k in self._burn_name_map if k.startswith(code)]
+        if prefix_hits:
+            return self._burn_name_map[min(prefix_hits, key=len)]
+        rev_hits = [k for k in self._burn_name_map if code.startswith(k)]
+        if rev_hits:
+            return self._burn_name_map[max(rev_hits, key=len)]
+        return ""
 
     def load_hospital_settlement_data(self, file_path: str) -> pd.DataFrame:
         """
@@ -1206,23 +1268,32 @@ class LocalDirectoryGenerator:
                 return True
         return False
 
-    def _burn_area_cat(self, age_cat: str, t4: str) -> str:
-        """由 T31/T32 第4位 + 年龄分档，映射《函》烧伤面积分类。
+    def _burn_area_from_name(self, name: str, age_cat: str) -> str:
+        """由 T31/T32 名称中的「百分比区间」+ 年龄分档，映射《函》烧伤面积分类。
 
-        <18岁：0→10%以下, 1-9→10%以上；
-        ≥18岁：0→10%以下, 1→10%-20%, 2→20%-30%, 3-9→30%以上。
+        名称示例：'体表10-19%的烧伤'、'累及体表20%~29%的烧伤'、'体表小于10%的烧伤'、
+        '累及体表90%及以上的烧伤'。解析其中的数字与『以下/小于/及以上/大于』判定：
+          <18岁：10%以下 / 10%以上
+          ≥18岁：10%以下 / 10%-20% / 20%-30% / 30%以上
         """
-        if not (t4 and t4.isdigit()):
+        if not name:
             return "10%以下"
-        d = int(t4)
+        nums = re.findall(r"\d+", name)
+        # "10%以下" / "小于10%"：最低档
+        if ("以下" in name or "小于" in name) and nums:
+            return "10%以下"
+        if not nums:
+            return "10%以下"
+        lb = int(nums[0])
+        if "及以上" in name or "大于" in name:
+            lb = max(lb, 90)
+        if lb < 10:
+            return "10%以下"
         if age_cat == "<18岁":
-            return "10%以下" if d == 0 else "10%以上"
-        # ≥18岁
-        if d == 0:
-            return "10%以下"
-        if d == 1:
+            return "10%以上"
+        if lb < 20:
             return "10%-20%"
-        if d == 2:
+        if lb < 30:
             return "20%-30%"
         return "30%以上"
 
@@ -1231,40 +1302,52 @@ class LocalDirectoryGenerator:
         age: int, day_age: int, birth_date: str, admission_date: str,
     ) -> Optional[str]:
         """③ 诊断辅助细分·烧伤类（依据《函》5016–5039）：先区分年龄，再按
-        烧伤程度(主诊断 T29/T30 指定深度码) + 面积(次要诊断 T31/T32 类目) 分组。
+        烧伤程度(主诊断 T29/T30 名称中的 一度/二度/三度) + 面积(次要诊断 T31/T32
+        名称中的百分比区间) 分组。程度与面积均取自 ICD *名称*，不使用编码第4位。
 
         严格对齐《函》24 组（程度×面积×年龄），返回条目号(DIP 编码，如 "5018")；
-        非烧伤病种返回 None。
+        非烧伤病种 / 一度·四度烧伤(《函》无对应组) 返回 None（回落基本规则）。
         """
         diag = self._clean_str(main_diag_code).upper()
-        # 烧伤程度：主诊断命中 T29(多部位)/T30(单部位) + 第4位深度码
+        # 烧伤程度：主诊断命中 T29(多部位)/T30(单部位)，依据名称含 一度/二度/三度 判定
         site = None
-        degree_bucket = None
+        degree_level = None
+        main_name = ""
         for c in self._split_codes(diag):
-            if c.startswith("T29."):
-                site = "多部位"
-                after = c.split(".", 1)[1] if "." in c else ""
-                degree_bucket = self.BURN_DEGREE_BUCKET.get(after[0] if after else "")
+            if c.startswith("T29") or c.startswith("T30"):
+                main_name = self._icd10_burn_name(c)
+                if "多处" in main_name or "多部位" in main_name:
+                    site = "多部位"
+                else:
+                    site = "单部位"
+                if "四度" in main_name:
+                    degree_level = "四度"
+                elif "三度" in main_name:
+                    degree_level = "三度"
+                elif "二度" in main_name:
+                    degree_level = "二度"
+                elif "一度" in main_name:
+                    degree_level = "一度"
                 break
-            if c.startswith("T30."):
-                site = "单部位"
-                after = c.split(".", 1)[1] if "." in c else ""
-                degree_bucket = self.BURN_DEGREE_BUCKET.get(after[0] if after else "")
-                break
-        if site is None or degree_bucket is None:
+        if site is None or not main_name or degree_level is None:
             return None
-        degree_cat = ("多部位" if site == "多部位" else "") + degree_bucket  # 多部位二度/三度, 二度/三度
+
+        # 《函》5016-5039 仅定义 二度/三度 两档（含多部位）；一度·四度无对应组 → 不进入细分
+        if degree_level in ("一度", "四度"):
+            return None
+        degree_cat = ("多部位" if site == "多部位" else "") + degree_level  # 多部位二度/三度, 二度/三度
 
         # 年龄：先区分年龄（岁）；<18岁 / ≥18岁
         age_years = self._calc_age_years(age, day_age, birth_date, admission_date)
         age_cat = "<18岁" if age_years < self.BURN_AGE_ADULT else "≥18岁"
 
-        # 面积：次要诊断含 T31/T32（按体表累及面积），分年龄映射面积分类
+        # 面积：次要诊断含 T31/T32，取名称中的百分比区间 → 年龄分档面积分类
         area_cat = "10%以下"  # 缺省（保守最小档）：次要诊断无 T31/T32 时归最小面积档
         for c in self._split_codes(related_diag_code):
             if c.startswith("T31") or c.startswith("T32"):
-                after = c.split(".", 1)[1] if "." in c else ""
-                area_cat = self._burn_area_cat(age_cat, after[0] if after else "")
+                rel_name = self._icd10_burn_name(c)
+                if rel_name:
+                    area_cat = self._burn_area_from_name(rel_name, age_cat)
                 break
 
         # 严格对齐《函》5016–5039：查 (程度, 年龄, 面积) → 条目号
