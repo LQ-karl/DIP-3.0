@@ -2,9 +2,11 @@
 DIP测算工具 - 新功能综合测试（真实断言版）
 测试内容：
 1. 医保结算清单导入（4101A接口）
-2. 本地目录库输出（DIP3.0格式）
-3. 辅助目录分型表格
-4. 医疗机构等级系数选择
+2. 辅助目录分型表格
+3. 医疗机构等级系数选择
+
+（原「本地目录库导出」用例随 local_directory_exporter 旧模块一并移除：
+ 目录导出统一由 LocalDirectoryGenerator 的导出方法承担，见 test_local_directory.py）
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,7 +16,6 @@ from src.utils.paths import get_output_dir
 from pathlib import Path
 from src.models.models import MedicalRecord, DiseaseGroup
 from src.interfaces.settlement_importer import SettlementDataImporter, ImportConfig
-from src.core.local_directory_exporter import LocalDirectoryExporter
 from src.core.auxiliary_directory_exporter import AuxiliaryDirectoryExporter
 from src.core.hospital_coefficient_selector import (
     HospitalCoefficientSelector, CoefficientCalculationConfig,
@@ -87,24 +88,6 @@ def test_settlement_import():
     assert result.records[0].total_cost == Decimal("18000")
 
 
-def test_local_directory_export():
-    """本地目录库导出（DIP3.0 格式）：生成 2 个病种组并导出 Excel。"""
-    records = generate_test_records()
-    exporter = LocalDirectoryExporter()
-
-    directory = exporter.generate_from_records(records)
-    assert directory.version, "目录库版本不应为空"
-    assert len(directory.records) == 2, f"应为 2 个病种组，实际 {len(directory.records)}"
-    for rec in directory.records:
-        assert rec.dip_code, f"病种编码不应为空: {rec.disease_name}"
-        assert isinstance(rec.disease_value, Decimal)
-        assert rec.disease_value >= 0, f"病种 {rec.dip_code} 的病种分值应非负"
-
-    output_path = str(get_output_dir() / "test_local_directory_dip30.xlsx")
-    exporter.export_to_excel(directory, output_path)
-    assert Path(output_path).exists(), "DIP3.0 本地目录库未导出"
-
-
 def test_auxiliary_directory_export():
     """辅助目录分型：35 条记录均应产出分型结果并导出 Excel。"""
     records = generate_test_records()
@@ -166,7 +149,6 @@ def test_hospital_coefficient_selection():
 
 if __name__ == "__main__":
     test_settlement_import()
-    test_local_directory_export()
     test_auxiliary_directory_export()
     test_hospital_coefficient_selection()
     print("test_new_features 全部通过")

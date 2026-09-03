@@ -9,8 +9,7 @@ sys.path.insert(0, '.')
 import pandas as pd
 from decimal import Decimal
 from src.core.local_directory_generator import LocalDirectoryGenerator
-from src.core.basic_disease_group import DiseaseGroup
-from src.models.models import GroupType, MedicalRecord
+from src.models.models import DiseaseGroup, GroupType, MedicalRecord
 
 XLSX = 'output/qk_merged_settlement.xlsx'
 df = pd.read_excel(XLSX)
@@ -18,7 +17,7 @@ print(f"载入 {len(df)} 行")
 
 gen = LocalDirectoryGenerator(threshold=15)
 gen.load_national_directory('data/DIP3.0国家目录库.xlsx')
-print(f"国家目录已加载：_nat_dip_codes={len(gen._nat_dip_codes)} 条, _nat_lbw={len(gen._nat_lbw)} 条")
+print(f"国家目录已加载：_nat_dip_codes={len(gen._nat_dip_codes)} 条")
 
 # 直接按合并表列名映射（与 Web _import_df_to_records 同义），避免触发 streamlit import
 def s(row, *names):
@@ -91,9 +90,6 @@ for g in temp.values():
     if orig in getattr(gen, '_nat_dip_codes', set()):
         ndip = orig
         matched = True
-    elif orig.startswith('PRI|TRANSPLANT') or orig.startswith('PRI|LIFESUPPORT'):
-        ndip = gen._nat_dip_for_op(orig.split('|')[2])
-        matched = bool(ndip)
     else:
         diag4 = gen._extract_icd4(g.main_diag_code)
         ndip = gen._nat_dip_for_diag_oprn(diag4, g.main_oprn_code)

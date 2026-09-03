@@ -577,7 +577,7 @@ def test_diagnostic_auxiliary_subdivision():
     """核心病种第三层·诊断辅助细分（③成组层，DIP3.0 新目录引擎版）：与第三步辅助分型严格区分。
 
     引擎自动加载 data/DIP3.0国家目录库.xlsx 后，③ 由国家目录 FZ 行直出方案序号；
-    引擎未命中（国家目录无对应行）时回落内置种子规则描述性键（向后兼容）。
+    引擎未命中（国家目录无对应行）时回落 ④ 基本规则键（引擎唯一权威，无种子回落）。
     验证与第三步「触发式辅助分型」(严重程度/年龄/ICU/CCI，不产成组键) 机制不同：
       (A) 肿瘤放化疗靶向免疫：主诊断 Z51.1/Z51.8 + 其他诊断 C 范围
           × 手术组合（目录行以 + 表示 AND：99.2503 / 99.2503+99.2800x006 / 三联）
@@ -587,7 +587,7 @@ def test_diagnostic_auxiliary_subdivision():
           → FZ-1836(耐药)/FZ-1837(非耐药)/FZ-1840(A17耐药)/FZ-1829(胸廓成形)；
       (C) 烧伤类：主诊断 T20-T25 二度/三度部位码 + 其他诊断 T31/T32 面积档
           × 手术（保守/切痫86.22族/植皮86.6族）→ FZ-1745/1746/1747/1764；
-          T30(未特指)不在目录烧伤行主诊断内 → 引擎未命中回落种子规则(5025，向后兼容)；
+          T30(未特指)不在目录烧伤行主诊断内 → 引擎未命中回落 ④ 基本规则（T30||）；
           一度(T30.100)《目录》无对应组 → 基本规则。
     非肿瘤非结核非烧伤病种不进入 ③（K35.9→JC-3625 基本规则）。
     肿瘤其他诊断范围收窄为 C00-C95 允许范围，C97/D 类不再触发肿瘤细分。
@@ -627,7 +627,8 @@ def test_diagnostic_auxiliary_subdivision():
     add("T21.2", op="86.2200x011", reldx="T31.0")                           # 二度 <10% 切痂 → FZ-1746
     add("T21.2", op="86.6201", reldx="T31.0")                               # 二度 <10% 植皮 → FZ-1747
     add("T21.3", reldx="T31.4")                                             # 三度 30-49% 保守 → FZ-1764
-    # (C-向后兼容) T30.2 未特指部位：目录烧伤行不含 T30 → 引擎未命中 → 种子规则 5025
+    # (C-回落) T30.2 / T30.100：新目录烧伤行不含 T30（未特指/一度）→ 引擎未命中
+    #          → ④ 基本规则（诊断4位键 T30||，2 例同组；旧《函》5025 种子编码已废弃）
     add("T30.2", reldx="T31.1", **{"年龄": 35})
     # (C-一度负例) T30.100 = 一度烧伤（目录无对应组）→ 不进入诊断辅助细分 → 基本规则
     add("T30.100", reldx="T31.1", **{"年龄": 40})
@@ -668,60 +669,15 @@ def test_diagnostic_auxiliary_subdivision():
         assert seq in keys, f"烧伤应直出 {seq}，实际 {sorted(keys)}"
         assert getattr(groups[seq], "national_matched", False) is True
         assert getattr(groups[seq], "grouping_layer", "") == "诊断辅助细分"
-    # (C-向后兼容) T30.2 → 种子规则条目号 5025（目录烧伤行不含 T30，引擎未命中回落）
-    assert "5025" in keys, "T30.2 应经种子规则回落 5025（向后兼容）"
+    # (C-回落) T30.2(35岁) 与 T30.100(40岁) 均落 ④ 基本规则同键 T30||（2 例）
+    assert groups["T30||"].case_count == 2, \
+        f"T30.2 与 T30.100 应同落基本规则键 T30||(2例)，实际 {groups.get('T30||') and groups['T30||'].case_count}"
+    assert groups["T30||"].grouping_layer == "基本规则"
     # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分
     assert any(k.startswith("T31|") for k in keys), "T31 主诊断应走基本规则"
 
     # ③ 与基本规则互不干扰：对照组 K35 走基本规则，不在 ③
     assert "JC-3625" in keys and groups["JC-3625"].grouping_layer == "基本规则"
-    # 一度烧伤 T30.100 → 基本规则（目录无对应组）
-    assert any(k.startswith("T30") and k != "5025" for k in keys), "一度烧伤应回落基本规则"
-
-
-def test_burn_main_diag_dict_from_attachment():
-    """③ 烧伤主诊断字典以权威附件 burn_degree_dict.xlsx「烧伤程度」sheet 为准（216 条）。
-
-    验证：
-      - 字典覆盖全部 T20–T25 各部位二度/三度/腐蚀伤 + T29(多部位) + T30(未特指) 共 216 条；
-      - 部位特异码正确归类（躯干三度 T21.300→三度单部位；躯干二度腐蚀伤 T21.600→二度腐蚀伤）；
-      - 多部位判定：T29.300→多部位三度，T29.200→多部位二度（附件含类目级 T29.200/300）；
-      - 一度(.0)不在附件 → 不进字典（T30.100 不在）；
-      - classify：部位特异(T21.300)+面积(T31.1)→5019；多部位(T29.200)+T31.1→5037；
-        一度(T30.100)→None；截断码(T30.2)→5025；T30.200X001(不在附件)→None。
-    """
-    gen = LocalDirectoryGenerator(threshold=15)
-    d = gen._burn_main_diag_dict
-
-    # 权威附件全量载入
-    assert len(d) == 216, f"主诊断字典应覆盖全部部位特异码，实际 {len(d)} 条"
-    # 8 个通用/多部位兜底码必在（与附件一致）
-    for code in ("T30.200", "T30.300", "T30.600", "T30.700",
-                 "T29.200X001", "T29.300X001", "T29.600X001", "T29.700X001"):
-        assert code in d, f"主诊断字典应含 {code}"
-
-    # 部位特异码：躯干三度/二度（含腐蚀伤）
-    assert d["T21.300"]["degree"] == "三度" and d["T21.300"]["site"] == "单部位"
-    assert d["T21.200"]["degree"] == "二度" and d["T21.200"]["site"] == "单部位"
-    assert d["T21.600"]["degree"] == "二度" and d["T21.600"]["burn_type"] == "腐蚀伤"
-    assert d["T21.700"]["degree"] == "三度" and d["T21.700"]["burn_type"] == "腐蚀伤"
-    # 其他部位也应覆盖
-    for code in ("T20.300", "T22.300", "T23.300", "T24.300", "T25.300"):
-        assert code in d and d[code]["degree"] == "三度", f"部位特异三度码应覆盖 {code}"
-
-    # 多部位判定（附件含类目级 T29.200/300）
-    assert d["T29.300"]["site"] == "多部位" and d["T29.300"]["degree"] == "三度"
-    assert d["T29.200"]["site"] == "多部位" and d["T29.200"]["degree"] == "二度"
-
-    # 一度(.0)不在附件 → 不进字典
-    assert "T30.100" not in d, "一度烧伤码不应进入主诊断字典"
-
-    # classify：部位特异 + 面积 → 正确 24 组条目号
-    assert gen._classify_burn("T21.300", "T31.1", 35, 0, "", "") == "5019"   # 三度单部位,≥18,10%-20%
-    assert gen._classify_burn("T29.200", "T31.1", 35, 0, "", "") == "5037"   # 多部位二度,≥18,10%-20%
-    assert gen._classify_burn("T30.100", "", 35, 0, "", "") is None          # 一度
-    assert gen._classify_burn("T30.2", "T31.1", 35, 0, "", "") == "5025"     # 截断码→T30.200 二度单部位
-    assert gen._classify_burn("T30.200X001", "", 35, 0, "", "") is None      # 不在附件
 
 
 def test_national_dip_alignment():
@@ -734,7 +690,7 @@ def test_national_dip_alignment():
       ③ 肿瘤：Z51.1/Z51.8 × C范围 × 手术组合 → FZ-1774/FZ-1793/FZ-1806/FZ-1802；
       ③ 结核：FZ-1837(非耐药)/FZ-1836(耐药,双路径同组)/FZ-1840(A17)/FZ-1829(胸廓成形)；
       ③ 烧伤：T21.2+T31.0 → FZ-1745（目录烧伤行主诊断=T20-T25 部位码）。
-    引擎未命中时回落内置种子规则描述性键（向后兼容）。
+    引擎未命中时回落 ④ 基本规则键（引擎唯一权威）。
     """
     rows = []
 
@@ -1258,7 +1214,7 @@ def test_priority_merge_aux_respect_threshold():
     low_specs = [
         ("先期分组", dict(dx="P07.0", day_age=10, birth_weight=1400, n=1)),
         ("并项规则", dict(dx="I20.0", op="36.0700", n=1)),
-        ("诊断辅助细分", dict(dx="T30.2", reldx="T31.1", age=35, n=1)),
+        ("诊断辅助细分", dict(dx="T21.2", reldx="T31.0", n=1)),
         ("基本规则", dict(dx="K35.9", op="47.0100", n=1)),
     ]
     for layer, kw in low_specs:
@@ -1274,7 +1230,7 @@ def test_priority_merge_aux_respect_threshold():
     high_specs = [
         ("先期分组", dict(dx="P07.0", day_age=10, birth_weight=1400, n=10)),
         ("并项规则", dict(dx="I20.0", op="36.0700", n=10)),
-        ("诊断辅助细分", dict(dx="T30.2", reldx="T31.1", age=35, n=10)),
+        ("诊断辅助细分", dict(dx="T21.2", reldx="T31.0", n=10)),
         ("基本规则", dict(dx="K35.9", op="47.0100", n=10)),
     ]
     for layer, kw in high_specs:

@@ -26,4 +26,4 @@ gen = LocalDirectoryGenerator(threshold=15)
 gen.load_national_directory(path)
 print("\n[nat_dip_for_diag_oprn] N18.5 + 55.6 ->", gen._nat_dip_for_diag_oprn("N18.5", "55.6"))
 print("[nat_dip_for_diag_oprn] N18.5 + 55.69 ->", gen._nat_dip_for_diag_oprn("N18.5", "55.69"))
-print("[nat_dip_for_op] 55.6 ->", gen._nat_dip_for_op("55.6"))
+# 旧先期分组反查 _nat_dip_for_op 已随种子回落移除

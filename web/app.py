@@ -505,27 +505,6 @@ def _calc_run_stage():
                 day_age=record.day_age, birth_weight=record.birth_weight, age=record.age,
                 birth_date=record.birth_date, admission_date=record.admission_date,
             )
-            # 先期分组·器官移植/呼吸循环支持：按 (主诊断 + 手术) 查国家目录，
-            # 将同一手术码下混有的多种主诊断拆成多个成组键（显示行），
-            # 使每行国家DIP码的类目与其真实主诊断前3位一致。
-            # 注意：layer 保持"先期分组"不变（排序需要）。
-            if layer == "先期分组" and (
-                cluster_key.startswith("PRI|LIFESUPPORT")
-                or cluster_key.startswith("PRI|TRANSPLANT")
-                or cluster_key.startswith("PRI|COMBINED")
-            ):
-                _parts = cluster_key.split("|")
-                _op = _parts[2] if len(_parts) > 2 else ""
-                _diag4 = gen._extract_icd4(record.main_diag_code or "")
-                if _op and _diag4:
-                    if cluster_key.startswith("PRI|COMBINED"):
-                        # 4966 组合组：呼吸机[≥96h] + CRRT，按 (诊断 + 双手术) 查国家目录
-                        _ndip = gen._nat_dip_for_combined(
-                            _diag4, gen._priority_combined_966_vent, gen._priority_combined_966_crrt)
-                    else:
-                        _ndip = gen._nat_dip_for_diag_oprn(_diag4, _op)
-                    if _ndip:
-                        cluster_key = _ndip  # 按(诊断+手术)查到的国家DIP码成组→同一手术按诊断拆多行
             disease_code = cluster_key
             disease_name = record.main_diag_name
             main_diag_code = record.main_diag_code
@@ -571,13 +550,6 @@ def _calc_run_stage():
                 if orig in getattr(gen, '_nat_dip_codes', set()):
                     ndip = orig          # ①/③ 已直出国家标准 DIP 码
                     matched = True
-                elif (orig.startswith("PRI|TRANSPLANT") or orig.startswith("PRI|LIFESUPPORT")
-                      or orig.startswith("PRI|COMBINED")):
-                    # 先期分组已在成组循环中按 (主诊断+手术) 查国家目录并拆行；
-                    # 残留未匹配到的 PRI| 键保持原样（诚实标记未匹配），
-                    # 不再按手术反查注入错误类目(如 A41.9)。
-                    ndip = ""
-                    matched = False
                 else:
                     # ②/④ 基本规则/并项规则：按 诊断(4位)+手术 查国家目录
                     diag4 = gen._extract_icd4(g.main_diag_code)
