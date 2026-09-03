@@ -20,6 +20,7 @@ from ..core.auxiliary_directory import (
     CCICalculator, DiseaseSeverityClassifier, AgeFeatureClassifier, ICUStayClassifier
 )
 from ..utils.paths import get_data_dir, get_output_dir
+from ..core.national_directory_v30 import NationalDirectoryV30, NationalMatch, get_national_engine
 
 
 class LocalDirectoryGenerator:
@@ -35,6 +36,12 @@ class LocalDirectoryGenerator:
         "基本规则": 3,
         "综合病种": 4,
     }
+
+    # 基层病种：「基层医疗机构」默认范围（一级及以下）
+    #   规范原文（第三章第四节）：设置基层病种是引导三级医疗机构功能归位，发挥二级
+    #   医疗机构枢纽作用；遴选条件之一为「基层医疗机构病例占比较大」。
+    #   此处「基层医疗机构」口径经用户 2026-09-04 确认 = 一级及以下。
+    DEFAULT_GRASSROOT_LEVELS = ("一级", "社区卫生服务中心", "乡镇卫生院")
 
     @staticmethod
     def _layer_sort_key(g) -> Tuple[int, int, str]:
@@ -95,8 +102,40 @@ class LocalDirectoryGenerator:
     ]
     # 年龄分界（岁）：《函》烧伤 <18岁 / ≥18岁
     BURN_AGE_ADULT = 18
+    # ③ 诊断辅助细分·烧伤类：主诊断字典兜底（仅 xlsx 缺失/加载失败时启用）。
+    #   权威来源为 data/burn_degree_dict.xlsx「烧伤程度」sheet（216 条，医保版2.0 编码，
+    #   覆盖 T20–T25 各部位 + T29 多部位 + T30 未特指），由 _load_burn_main_diag_dict 载入。
+    #   本兜底数与权威字典完全一致（T30/T29 通用+多部位 8 码），setdefault 不覆盖已载入码。
+    #   每条: 医保2.0编码 -> (程度, 是否多部位, 烧伤/腐蚀伤, 医保2.0名称)。
+    BURN_MAIN_DIAG_FALLBACK = {
+        "T30.200":     ("二度", "单部位", "烧伤",   "二度烧伤"),
+        "T30.300":     ("三度", "单部位", "烧伤",   "三度烧伤"),
+        "T30.600":     ("二度", "单部位", "腐蚀伤", "二度腐蚀伤"),
+        "T30.700":     ("三度", "单部位", "腐蚀伤", "三度腐蚀伤"),
+        "T29.200X001": ("二度", "多部位", "烧伤",   "多处二度烧伤"),
+        "T29.300X001": ("三度", "多部位", "烧伤",   "多处三度烧伤"),
+        "T29.600X001": ("二度", "多部位", "腐蚀伤", "多处二度腐蚀伤"),
+        "T29.700X001": ("三度", "多部位", "腐蚀伤", "多处三度腐蚀伤"),
+    }
+    # ③ 诊断辅助细分·烧伤类：次要诊断面积字典（来源 ICD-10 医保2.0 版 T31/T32 类目）
+    #   T31=烧伤面积、T32=腐蚀伤面积；面积分档仍由名称中的百分比区间解析（见 _burn_area_from_name）。
+    BURN_AREA_PREFIXES = ("T31", "T32")
     # 先期分组·低出生体重判定阈值（g）：高于该值不属低出生体重，不进入先期分组
     LBW_BIRTH_WEIGHT_THRESHOLD = 2500
+
+    # 监护病房住院天数（重症）判断补充规则
+    # ─────────────────────────────────────────────────────────────────────
+    # 国家 DIP3.0 规范未明确「监护病房住院天数」如何分型，故补充两种业务判定方式，
+    # 由 self.icu_days_rule 切换（后期据需求再确定使用哪种）：
+    #   判断1 'charge_item'：结算含 重症监护/层流洁净 床位费收费项目 → 监护病房住院天数 = 特级护理天数
+    #   判断2 'ward_type'  ：重症监护病房类型 非空                       → 监护病房住院天数 = 特级护理天数
+    # 两种判断均以「特级护理天数(spga_nurscare_days)」作为监护病房住院天数；与既有
+    # icu_days(如 icu_dura/ICU天数) 取大值，不丢失任何显式提供的监护天数。
+    ICU_BED_FEE_CODES = {
+        "011105000060000",  # 床位费(重症监护)
+        "011105000070000",  # 床位费(层流洁净)
+    }
+    ICU_DAYS_RULE_OPTIONS = ("charge_item", "ward_type")
 
     def __init__(
         self,
@@ -107,6 +146,11 @@ class LocalDirectoryGenerator:
         min_trim_group_size: int = 25,
         max_overall_trim_rate: float = 0.08,
         exclude_below_threshold: bool = False,
+        icu_days_rule: str = "charge_item",
+        enable_grassroot: bool = True,
+        grassroot_min_basic_ratio: float = 0.5,
+        grassroot_max_cv: float = 0.7,
+        grassroot_hospital_levels: Optional[List[str]] = None,
     ):
         """
         初始化本地目录库生成器
@@ -119,6 +163,13 @@ class LocalDirectoryGenerator:
             min_trim_group_size: 触发裁剪的最小组内病例数；小于该值的组不做裁剪，
                 以避免小样本组内单条记录占比过大导致过度裁剪（保证整体裁剪率可控）
             max_overall_trim_rate: 整体裁剪率上限（默认 0.08，即最高 8%），超出则告警
+            icu_days_rule: 监护病房住院天数(重症)判定方式，取值见 ICU_DAYS_RULE_OPTIONS；
+                'charge_item'(默认，判断1)=凭重症监护/层流洁净床位费收费项目；
+                'ward_type'(判断2)=凭重症监护病房类型非空。两者均以特级护理天数为天数。
+            enable_grassroot: 是否启用基层病种本地遴选（《技术规范》第三章第四节）
+            grassroot_min_basic_ratio: 基层医疗机构病例占比下限（规范"占比较大"，地方自定）
+            grassroot_max_cv: 基层病种组内变异系数上限（规范示例：CV 值不超过 0.7）
+            grassroot_hospital_levels: 「基层医疗机构」等级范围，默认一级及以下
         """
         self.threshold = threshold
         self.data_dir = data_dir if data_dir else str(get_data_dir())
@@ -129,14 +180,14 @@ class LocalDirectoryGenerator:
         # 综合病种质量控制：聚类后仍低于地方临界值的组是否剔除（规范为"可予以剔除"，
         # 默认关闭以保留对低频病例的覆盖；如需收紧可置 True）
         self.exclude_below_threshold = exclude_below_threshold
+        # 监护病房住院天数(重症)判定方式（判断1/判断2 切换；国家未明确分型，业务补充）
+        self.icu_days_rule = icu_days_rule if icu_days_rule in self.ICU_DAYS_RULE_OPTIONS else "charge_item"
 
         self.grouping_engine = DIPGroupingEngine(threshold=threshold)
         self.value_calculator = ValueCalculator()
         self.data_loader = DataLoader(data_dir)
 
         # CCI 与疾病严重程度（中重度分型）字典（权威数据源，规范逻辑测算）
-        self.cci_exact: Dict[str, int] = {}      # 精确诊断码 -> CCI 分数
-        self.cci_prefix: Dict[str, int] = {}     # 3 位前缀 -> CCI 分数
         self.severity_entries: List[Dict] = []   # 中重度分型字典条目
         self._load_dictionaries()
 
@@ -144,6 +195,12 @@ class LocalDirectoryGenerator:
         # 用于按名称判定「一度/二度/三度」与「面积百分比」，而非编码第4位
         self._burn_name_map: Dict[str, str] = {}
         self._load_icd10_name_map()
+        # 烧伤主诊断字典（权威附件 burn_degree_dict.xlsx，216 条，覆盖 T20–T25 各部位）
+        self._load_burn_main_diag_dict()
+
+        # ICD-10 医保2.0 版 类目名称映射（综合病种命名权威来源）
+        self._icd10_category_map: Dict[str, str] = {}
+        self._load_icd10_category_map()
 
         # 手术操作类别映射（综合病种四子组所需）
         # 国临版手术码 -> 类别（手术/治疗性操作/诊断性操作/介入治疗）
@@ -161,6 +218,22 @@ class LocalDirectoryGenerator:
         # 综合病种质量控制：组内变异系数(CV)上限，超过则标记剔除
         self.max_cv_threshold: float = 1.0
 
+        # ---- 基层病种（《DIP3.0 技术规范（征求意见稿）》第三章第四节）----
+        # 基层病种是「核心病种中的一个类别」，由地方在本地数据中遴选：
+        #   候选池：《分组方案》基层病种 sheet 名录（诊断+手术对；手术空=仅保守治疗组）
+        #   校验项：① 属核心病种 ② 基层医疗机构病例占比 ≥ 阈值 ③ 组内 CV ≤ 阈值
+        # 口径经用户 2026-09-04 确认：基层机构=一级及以下、占比≥50%、CV≤0.7。
+        self.enable_grassroot = enable_grassroot
+        self.grassroot_min_basic_ratio = float(grassroot_min_basic_ratio)
+        self.grassroot_max_cv = float(grassroot_max_cv)
+        self.grassroot_levels = set(
+            grassroot_hospital_levels
+            if grassroot_hospital_levels
+            else self.DEFAULT_GRASSROOT_LEVELS
+        )
+        # 遴选过程留痕（导出《基层病种遴选依据表》）
+        self.grassroot_report: List[Dict] = []
+
         # 综合病种被质控剔除的病例数（统计报告用）
         self.excluded_cases: int = 0
 
@@ -169,6 +242,17 @@ class LocalDirectoryGenerator:
         self.core_groups = []  # 核心病种
         self.mixed_groups = []  # 综合病种
         self.national_directory = None  # 国家目录库
+
+        # ---- DIP 3.0 版国家目录引擎（以《按病种分值（DIP）付费3.0版分组方案》为准） ----
+        # 四层成组统一走 XQ/BX/FZ/JC 分段查表；加载失败则回退到内置种子规则（向后兼容）。
+        self._nat_engine: Optional[NationalDirectoryV30] = None
+        # seq(方案序号) -> NationalMatch：成组时登记，供 _build_group 回填国家目录元数据
+        self._nat_seq_meta: Dict[str, NationalMatch] = {}
+        self._load_national_engine()
+
+        # 不纳入分组：主要诊断剔除清单（命中即不参与分组测算）
+        self.excluded_diag_records: List[Dict] = []
+        self.excluded_diag_cases: int = 0
 
         # 烧伤国家目录（函5016-5039）自包含：无论是否加载 xlsx 均可用
         # （xlsx 导出截断缺失该段，故烧伤查表直接来自《函》PDF 第95–96页）
@@ -180,6 +264,19 @@ class LocalDirectoryGenerator:
         self.total_original_cases = 0   # 裁剪前总病例数
         self.total_trimmed_cases = 0    # 裁剪剔除的病例数
         self.overall_trim_rate = 0.0    # 整体裁剪率
+
+    def _load_national_engine(self) -> None:
+        """加载《DIP3.0版分组方案》国家目录引擎（XQ/BX/FZ/JC 分段查表）。"""
+        xlsx = os.path.join(self.data_dir, "DIP3.0国家目录库.xlsx")
+        if not os.path.exists(xlsx):
+            print(f"警告: 未找到国家目录库 {xlsx}，四层成组回退内置种子规则")
+            return
+        try:
+            # 模块级缓存：只读实例可安全复用，避免每个生成器实例重读 5-sheet xlsx + 建索引
+            self._nat_engine = get_national_engine(xlsx)
+        except Exception as e:  # noqa: BLE001
+            print(f"警告: 加载国家目录引擎失败，四层成组回退内置种子规则: {e}")
+            self._nat_engine = None
 
     def set_threshold(self, threshold: int):
         """
@@ -200,45 +297,14 @@ class LocalDirectoryGenerator:
     # 字典为权威数据源；CCI 分数与严重度等级严格按 DIP3.0 技术规范逻辑测算
     # ------------------------------------------------------------------
     def _load_dictionaries(self) -> None:
-        """加载 CCI 与疾病严重程度（中重度分型）字典，构建查表结构。"""
-        self._load_cci_dictionary()
-        self._load_severity_dictionary()
+        """加载 CCI 与疾病严重程度（中重度分型）字典，构建查表结构。
 
-    def _load_cci_dictionary(self) -> None:
-        """加载 CCI.xlsx：ICD10 代码 -> Charlson 组成部分 -> CCI 分数。
-
-        CCI 分数依据 Charlson 合并症指数权重（DIP3.0 技术规范逻辑）。
+        CCI 统一使用 CCICalculator 单引擎（B4），字典为权威数据源
+        （data/CCI.xlsx 的「得分」列，B3），不再维护第二套硬编码权重表。
         """
-        # Charlson 各组成部分权重（规范逻辑）
-        charlson_weights = {
-            "心肌梗死": 1, "充血性心力衰竭": 1, "周围血管疾病": 1, "脑血管疾病": 1,
-            "痴呆": 1, "慢性肺部疾病": 1, "结缔组织病": 1, "溃疡病": 1,
-            "轻度肝脏疾病": 1, "糖尿病": 1,
-            "偏瘫": 2, "中度或重度肾脏疾病": 2, "糖尿病合并并发症": 2,
-            "任何肿瘤": 2, "白血病": 2, "淋巴瘤": 2,
-            "中度或重度肝脏疾病": 3, "转移性实体瘤": 6, "AIDS": 6,
-        }
-        try:
-            df = self.data_loader.load_cci_index()
-        except Exception as e:
-            print(f"警告: 加载 CCI 字典失败，CCI 评分将为 0: {e}")
-            return
-
-        for _, row in df.iterrows():
-            code = str(row.get("ICD10代码", "")).strip()
-            component = str(row.get("Charlson组成部分", "")).strip()
-            if not code:
-                continue
-            score = 0
-            for key, val in charlson_weights.items():
-                if key in component:
-                    score = max(score, val)
-            if score == 0:
-                continue
-            self.cci_exact[code] = max(self.cci_exact.get(code, 0), score)
-            prefix3 = code[:3]
-            self.cci_prefix[prefix3] = max(self.cci_prefix.get(prefix3, 0), score)
-        print(f"已加载 CCI 字典: {len(self.cci_exact)} 条精确码")
+        # CCI 单引擎：由 CCICalculator 在构造时自行加载权威字典（含 得分 缺失回退）
+        self.cci_calculator = CCICalculator()
+        self._load_severity_dictionary()
 
     def _load_severity_dictionary(self) -> None:
         """加载 中重度分型诊断.xlsx：诊断码 -> (严重程度/辅助分型名称, 类型)。"""
@@ -277,29 +343,15 @@ class LocalDirectoryGenerator:
         order = {"重度": 6, "中度": 5, "轻度": 4, "转移": 3, "放疗": 2, "化疗": 1}
         return order.get(name, 0)
 
-    def _compute_group_cci(self, diag_codes: List[str]) -> int:
-        """病种组级 CCI 评分：按 Charlson 分类取同类最高分，再求和。
+    def _compute_group_cci(self, diag_codes: List[str], exclude_main: str = "") -> int:
+        """病种组级 CCI 评分（B1：不计入主诊断，仅用其他/相关诊断）。
 
-        Args:
-            diag_codes: 该病种组合涉及的诊断码列表（主诊断 + 相关诊断）
+        统一使用 CCICalculator 单引擎（B4），字典为权威数据源
+        （data/CCI.xlsx 的「得分」列；缺失得分的条目不参与评分，B3）。
         """
-        calc = CCICalculator()
-        max_scores: Dict[str, int] = {}
-        for code in diag_codes:
-            if not code:
-                continue
-            code4 = code[:4]
-            prefix3 = code[:3]
-            score = (
-                self.cci_exact.get(code)
-                or self.cci_exact.get(code4)
-                or self.cci_prefix.get(prefix3, 0)
-            )
-            if score > 0:
-                category = calc._get_disease_category(prefix3)
-                if category not in max_scores or score > max_scores[category]:
-                    max_scores[category] = score
-        return sum(max_scores.values())
+        exclude = self._clean_str(exclude_main).upper()
+        diags = [d for d in diag_codes if self._clean_str(d).upper() != exclude]
+        return self.cci_calculator.calculate_cci(diags)
 
     def _compute_group_severity(self, diag_codes: List[str]) -> Tuple[str, str]:
         """病种组级疾病严重程度：在字典中匹配诊断码，取最高优先级条目。
@@ -340,7 +392,12 @@ class LocalDirectoryGenerator:
             # 医保/手术编码含尾随零(如 47.0100)，默认解析为浮点会丢失，故强制按字符串读
             df = pd.read_excel(file_path, dtype=str)
         elif file_path.endswith('.csv'):
-            df = pd.read_csv(file_path, encoding='utf-8', dtype=str)
+            # 优先 utf-8；中文 Windows 常见 GBK 编码，解码失败自动回退（纯容错，
+            # 不影响既有 utf-8 CSV 行为，也不改变任何测算逻辑）
+            try:
+                df = pd.read_csv(file_path, encoding='utf-8', dtype=str)
+            except (UnicodeDecodeError, UnicodeError):
+                df = pd.read_csv(file_path, encoding='gbk', dtype=str)
         else:
             raise ValueError(f"不支持的文件格式: {file_path}")
         
@@ -368,22 +425,31 @@ class LocalDirectoryGenerator:
             self._nat_rows_by_dip[dip] = r.to_dict()
 
         # ---- 低出生体重先期(P07-01..05) ----
+        # 国家目录 xlsx 中 LBW 行的「相关手术操作编码」存的是年龄阈值(<29天)，体重分桶在
+        # 「主要诊断名称」(超低/极低/较低/低出生体重儿) 中，故按名称分桶解析体重区间
+        # （依据《函》4969–4973：超低<1000 / 极低1000-1499 / 较低1500-1999 / 低2000-2499）。
         self._nat_lbw: List[dict] = []
         for _, r in df.iterrows():
             if str(r.get('主要诊断编码', '')).strip() != 'P07':
                 continue
-            if '出生体重' not in str(r.get('主要诊断名称', '')):
+            name = str(r.get('主要诊断名称', ''))
+            # 仅取具体的「出生体重儿」先期分组桶(P07-01..05)，排除 P07-00 通用兜底行
+            if '出生体重儿' not in name:
                 continue
-            wt = str(r.get('相关手术操作编码', '') or '')
-            m_dash = re.search(r'(\d+)\s*-\s*(\d+)', wt)
-            if m_dash:
-                lo, hi = int(m_dash.group(1)), int(m_dash.group(2)) + 1
-            else:
-                m_lt = re.search(r'<\s*(\d+)', wt)
-                if not m_lt:
-                    continue
-                lo, hi = 0, int(m_lt.group(1)) + 1
-            self._nat_lbw.append({'dip': str(r['DIP编码']).strip(), 'lo': lo, 'hi': hi})
+            dip = str(r['DIP编码']).strip()
+            # 国家目录库 LBW 行：年龄阈值(<29天)存于「主要手术操作编码」，体重区间存于
+            # 「相关手术操作编码」（如 出生体重<750克 / 出生体重750-999克…），故从后者解析。
+            band = str(r.get('相关手术操作编码', '') or '')
+            # 从「相关手术操作编码」解析精确体重区间（严格对齐国家目录 4969–4973）：
+            #   <750 / 750-999 / 1000-1499 / 1500-1999 / 2000-2499 克
+            m = re.search(r'出生体重\s*<?\s*(\d+)(?:-(\d+))?\s*克', band)
+            if not m:
+                continue
+            if m.group(2) is None:        # "<750克" → 体重 < 750
+                lo, hi = 0, int(m.group(1))
+            else:                          # "750-999克" → 750 ≤ 体重 ≤ 999 → 上界开 1000
+                lo, hi = int(m.group(1)), int(m.group(2)) + 1
+            self._nat_lbw.append({'dip': dip, 'lo': lo, 'hi': hi, 'name': name})
 
         # ---- 肿瘤诊断辅助细分(Z51.1/Z51.8，主要手术操作列放 C 范围、相关列放治疗组合) ----
         self._nat_tumor: Dict[Tuple[str, str, str], str] = {}
@@ -419,6 +485,25 @@ class LocalDirectoryGenerator:
         # 烧伤（函5016-5039）自包含：重新并入（_nat_dip_codes 已在上文清空重建）
         self._build_burn_national()
 
+        # ---- 诊断并项（并项规则1）：由国家目录「主要诊断编码=3位类目(无小数点)」驱动 ----
+        # 国家目录中，凡「主要诊断编码」为 3 位类目码（如 I20 心绞痛 → I20-00..09）、不带
+        # 小数点的行，即为诊断并项组（在类目级合并，区别于带小数点的 ④ 基本规则 4 位码）。
+        # 故并项规则1 的家族清单应直接由这些 3 位类目码推导，而非硬编码。
+        # 但须排除已被其它层独占的 3 位类目，以维护「①先期 > ②并项 > ③诊断辅助细分 > ④基本规则」
+        # 的优先级与各自成组语义：
+        #   - P07  → ① 先期分组（低出生体重儿，按 诊断+天龄+体重 判，非并项）
+        #   - A17/A18/A19（及 A15/A16）→ ③ 诊断辅助细分（结核耐药），属独立核心病种层
+        _merge_excl = {"P07", "A15", "A16", "A17", "A18", "A19"}
+        nat_merge = set()
+        for _, r in df.iterrows():
+            nd = str(r.get('主要诊断编码', '')).strip().upper()
+            # 3 位类目码：1 字母 + 恰好 2 数字，无小数点、无 x 扩展
+            if re.fullmatch(r'^[A-Z]\d{2}$', nd) and nd not in _merge_excl:
+                nat_merge.add(nd)
+        # 并入并项规则1 家族集合（保留硬编码种子 I20 与 JSON 覆盖，三者取并集）
+        self._merge_diag_families |= nat_merge
+        self._nat_merge_diag_families = nat_merge
+
     def _build_burn_national(self):
         """构建烧伤国家目录（函5016-5039）查表：程度×年龄×面积 → 条目号。
 
@@ -442,19 +527,23 @@ class LocalDirectoryGenerator:
                 }
 
     def _load_icd10_name_map(self) -> None:
-        """从《ICD10国临版2.0对照医保版2.0_0125》抽取 T29/T30/T31/T32 名称映射。
+        """从《ICD10国临版2.0对照医保版2.0_0125》抽取 烧伤相关(T29/T30/T31/T32) 名称映射，
+        仅用于「面积字典」按名称判定百分比（见 _burn_area_from_name）。
 
-        烧伤（③ 诊断辅助细分）程度/面积严格按 ICD *名称* 判定（用户明确要求：
-        使用名称中的「一度/二度/三度」与「百分比区间」，不使用编码第4位）：
-          - 程度：主诊断名称含 一度/二度/三度/四度；多处/多部位 → 多部位；
-          - 面积：次要诊断 T31/T32 名称含百分比区间（如 体表10-19% / 累及体表20%~29%）。
+        重要：烧伤「主诊断字典」（程度+是否多部位）已改由权威附件
+        burn_degree_dict.xlsx 的「烧伤程度」sheet 载入（见 _load_burn_main_diag_dict），
+        覆盖 T20–T25 各部位二度/三度/腐蚀伤 + T29(多部位) + T30(未特指) 共 216 条，
+        替代旧版"正则精确匹配 8 个叶子码"的过严抽取（旧法漏掉全部 208 个部位特异码）。
+        本方法只负责面积名称查表（T31/T32 名称中的百分比区间）。
+
         仅抽取烧伤相关(T29/T30/T31/T32)编码的 国临版名称与医保版2.0名称，
         构建 code→name 查表（同时收纳两列编码，兼容清单用国临版或医保版码）。
         """
+        self._burn_name_map: Dict[str, str] = {}
         fname = "ICD10国临版2.0对照医保版2.0_0125.xlsx"
         path = os.path.join(self.data_dir, fname)
         if not os.path.exists(path):
-            print(f"警告: 未找到 {fname}，烧伤程度/面积名称判定不可用(不进入诊断辅助细分)")
+            print(f"警告: 未找到 {fname}，烧伤面积名称查表不可用(面积默认归最小档)")
             return
         try:
             import openpyxl
@@ -477,9 +566,111 @@ class LocalDirectoryGenerator:
                         # 国临版优先；同码两列同名时后者不覆盖；键统一大写以便不区分 x/X
                         self._burn_name_map.setdefault(code, name)
         except Exception as e:
-            print(f"警告: 加载 ICD10 名称映射失败，烧伤名称判定不可用: {e}")
+            print(f"警告: 加载 ICD10 名称映射失败，烧伤面积名称查表不可用: {e}")
             return
-        print(f"已加载烧伤 ICD 名称映射: {len(self._burn_name_map)} 条(T29/T30/T31/T32)")
+        print(f"已加载烧伤 ICD 名称映射: {len(self._burn_name_map)} 条(T29/T30/T31/T32，面积判定用)")
+
+    def _load_burn_main_diag_dict(self) -> None:
+        """载入权威《烧伤字典》主诊断字典（附件 burn_degree_dict.xlsx「烧伤程度」sheet，216 条）。
+
+        以用户整理的附件为唯一权威来源（"以附件为准"），替代旧版过严的正则抽取：
+          - 覆盖 T20(头颈)/T21(躯干)/T22(上肢)/T23(手)/T24(下肢)/T25(足) 各部位的
+            二度/三度/腐蚀伤及其 .x 拓展码，外加 T29(多部位) 与 T30(未特指)；
+          - 每行按「烧伤程度」列归 4 类：三度(单部位)/二度(单部位)/多部位三度/多部位二度；
+          - 编码一律用医保版2.0（结算数据即医保版2.0，无需国临版交叉映射）；
+          - 一度(.0)与未特指程度码不在附件内 → 不进入字典（回落基本规则）。
+        xlsx 缺失时回退 BURN_MAIN_DIAG_FALLBACK（8 码兜底，仅含 T30/T29 通用+多部位码）。
+        """
+        self._burn_main_diag_dict: Dict[str, Dict] = {}
+        fname = "burn_degree_dict.xlsx"
+        path = os.path.join(self.data_dir, fname)
+        if not os.path.exists(path):
+            print(f"警告: 未找到 {fname}，烧伤主诊断字典回退 8 码兜底(不进入诊断辅助细分)")
+            self._apply_burn_main_diag_fallback()
+            return
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            ws = wb["烧伤程度"]
+            rows = list(ws.iter_rows(values_only=True))
+            hdr = rows[0]
+            ci = {str(h).strip(): i for i, h in enumerate(hdr)}
+            c_code = ci.get("医保版2.0编码")
+            c_name = ci.get("医保版2.0名称")
+            c_cat = ci.get("烧伤程度")
+            for r in rows[1:]:
+                code = str(r[c_code] or "").strip().upper() if c_code is not None else ""
+                name = str(r[c_name] or "").strip() if c_name is not None else ""
+                cat = str(r[c_cat] or "").strip() if c_cat is not None else ""
+                if not code or not cat:
+                    continue
+                # cat ∈ {三度烧伤/腐蚀伤, 多部位三度烧伤/腐蚀伤, 二度烧伤/腐蚀伤, 多部位二度烧伤/腐蚀伤}
+                if cat.startswith("多部位"):
+                    site = "多部位"
+                    degree = "三度" if "三度" in cat else "二度"
+                else:
+                    site = "单部位"
+                    degree = "三度" if "三度" in cat else "二度"
+                burn_type = "腐蚀伤" if "腐蚀伤" in cat else "烧伤"
+                self._burn_main_diag_dict[code] = {
+                    "degree": degree, "site": site, "burn_type": burn_type, "name": name,
+                }
+        except Exception as e:
+            print(f"警告: 加载烧伤主诊断字典失败，回退 8 码兜底: {e}")
+            self._apply_burn_main_diag_fallback()
+            return
+        # 确保 8 兜底码始终存在（setdefault 不覆盖已载入的权威码）
+        self._apply_burn_main_diag_fallback()
+        print(f"已加载烧伤主诊断字典(权威附件): {len(self._burn_main_diag_dict)} 条(医保版2.0)")
+
+    def _apply_burn_main_diag_fallback(self) -> None:
+        """xlsx 缺失/漏抽时，确保 8 个权威叶子码始终可用。"""
+        for code, (deg, site, btype, name) in self.BURN_MAIN_DIAG_FALLBACK.items():
+            self._burn_main_diag_dict.setdefault(code, {
+                "degree": deg, "site": site, "burn_type": btype, "name": name,
+            })
+
+    def _burn_main_diag_lookup(self, code: str) -> Optional[Dict]:
+        """按编码查烧伤主诊断字典（兼容 国临版/医保版/截断码）。
+
+        返回 {"degree","site","burn_type","name"} 或 None（非烧伤程度主诊断）。
+        仅对"截断码"（小数点后不足 3 位，如 T30.2 / T29.7）做前缀展开；完整 3 位精度码
+        （如 T29.200）不在字典中时不向前缀更长的 X 扩展码（T29.200X001）回溯，以免把
+        类目描述码误判为叶子码。
+        """
+        code = self._clean_str(code).upper()
+        if not code:
+            return None
+        if code in self._burn_main_diag_dict:
+            return self._burn_main_diag_dict[code]
+        # 仅对截断码（小数点后 <3 位且无 X）做前缀展开
+        if "." in code:
+            after_dot = code.split(".", 1)[1]
+            if len(after_dot) < 3 and "X" not in after_dot:
+                prefix_hits = [k for k in self._burn_main_diag_dict if k.startswith(code)]
+                if prefix_hits:
+                    return self._burn_main_diag_dict[min(prefix_hits, key=len)]
+        return None
+
+    def _load_icd10_category_map(self) -> None:
+        """加载《ICD-10医保2.0版》抽取的「3 位类目码 -> 类目名称」映射。
+
+        该映射由 scripts/extract_icd10_category.py 从《ICD-10医保2.0版.pdf》一次性抽取，
+        存为 data/icd10_category_map.json。综合病种命名优先使用此权威类目名称；
+        缺失时（如非常见码）回退到病例名推导。
+        """
+        import json
+        fname = "icd10_category_map.json"
+        path = os.path.join(self.data_dir, fname)
+        if not os.path.exists(path):
+            print(f"警告: 未找到 {fname}，综合病种类目名称将回退到病例名推导")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._icd10_category_map = json.load(f)
+            print(f"已加载 ICD-10 医保2.0 类目名称映射: {len(self._icd10_category_map)} 条")
+        except Exception as e:
+            print(f"警告: 加载 ICD-10 类目名称映射失败: {e}")
 
     def _icd10_burn_name(self, code: str) -> str:
         """按编码查烧伤相关 ICD 名称（兼容国临版/医保版码，并做前缀匹配）。
@@ -514,7 +705,12 @@ class LocalDirectoryGenerator:
             # 医保/手术编码含尾随零(如 47.0100)，默认解析为浮点会丢失，故强制按字符串读
             df = pd.read_excel(file_path, dtype=str)
         elif file_path.endswith('.csv'):
-            df = pd.read_csv(file_path, encoding='utf-8', dtype=str)
+            # 优先 utf-8；中文 Windows 常见 GBK 编码，解码失败自动回退（纯容错，
+            # 不影响既有 utf-8 CSV 行为，也不改变任何测算逻辑）
+            try:
+                df = pd.read_csv(file_path, encoding='utf-8', dtype=str)
+            except (UnicodeDecodeError, UnicodeError):
+                df = pd.read_csv(file_path, encoding='gbk', dtype=str)
         else:
             raise ValueError(f"不支持的文件格式: {file_path}")
         
@@ -549,6 +745,7 @@ class LocalDirectoryGenerator:
             '相关诊断代码': 'related_diag_code',
             'related_diag_code': 'related_diag_code',
             '次要诊断编码': 'related_diag_code',
+            '相关诊断编码': 'related_diag_code',  # 兼容常见导出表头「相关诊断编码」
             
             '相关诊断名称': 'related_diag_name',
             'related_diag_name': 'related_diag_name',
@@ -603,6 +800,15 @@ class LocalDirectoryGenerator:
             '监护病房住院天数': 'icu_days',
             '重症监护天数': 'icu_days',
             'icu_days': 'icu_days',
+
+            # 重症判断补充字段（收费项目 / 病房类型 + 特级护理天数）
+            '特级护理天数': 'spga_nurscare_days',
+            'spga_nurscare_days': 'spga_nurscare_days',
+            '重症监护病房类型': 'scs_cutd_ward_type',
+            'scs_cutd_ward_type': 'scs_cutd_ward_type',
+            '收费项目编码': 'charge_item_codes',
+            'charge_item_codes': 'charge_item_codes',
+
             '出院状态': 'discharge_status',
             '离院方式': 'discharge_status',
             'discharge_status': 'discharge_status',
@@ -621,11 +827,101 @@ class LocalDirectoryGenerator:
             '入院时间': 'admission_date',
             '入院日期': 'admission_date',
             'admission_date': 'admission_date',
+
+            # 医疗机构等级（基层病种遴选：统计基层机构病例占比）
+            '医院等级': 'hospital_level',
+            '医疗机构等级': 'hospital_level',
+            '医保结算等级': 'hospital_level',
+            '定点医疗机构等级': 'hospital_level',
+            'hospital_level': 'hospital_level',
         }
         
         # 重命名列
         df_renamed = df.rename(columns=column_mapping)
+        # 多值列折叠：其他诊断1~5 / 其他手术1~5 分列 → 单一 related_* 字段（| 分隔）
+        df_renamed = self._fold_multi_value_columns(df_renamed)
         return df_renamed
+
+    @staticmethod
+    def _fold_multi_value_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """把「其他诊断1~5 / 其他手术1~5」等分列折叠进 related_diag_code / related_oprn_code。
+
+        真实 4101A 医保清单为分列结构（其他诊断编码1~5、其他手术操作编码1~5），
+        而引擎数据模型 related_diag_code / related_oprn_code 是「单字段多值」，
+        内部规范用 '|' 分隔（见 database/models.py 注释「多个用|分隔」、
+        parser_4101a.py 以 '|'.join 折叠）。宽表导入器此前只做 1:1 列名映射，
+        分列既不会被 rename 命中、也无法并入同一字段，导致整列被忽略。
+
+        本函数在规范化后显式折叠：扫描数字分列（兼容多种常见表头写法），
+        按行把非空编码/名称以 '|' 拼接写入 related_diag_code / related_oprn_code
+        （并与已存在的单值列合并、去重保序）。纯加法——输入若无分列则原样返回，
+        不改变任何单列场景的测算行为与结果。
+        """
+        diag_code_re = re.compile(
+            r'^(?:其他诊断编码|其他诊断代码|相关诊断编码|次要诊断编码|其他诊断)'
+            r'(?:编码|代码)?[\s_]*(\d+)$')
+        diag_name_re = re.compile(
+            r'^(?:其他诊断编码|其他诊断代码|相关诊断编码|次要诊断编码|其他诊断)'
+            r'(?:编码|代码)?[\s_]*(\d+)名称$')
+        oprn_code_re = re.compile(
+            r'^(?:其他手术操作编码|其他手术编码|相关手术操作编码|其他手术)'
+            r'(?:编码|代码)?[\s_]*(\d+)$')
+        oprn_name_re = re.compile(
+            r'^(?:其他手术操作编码|其他手术编码|相关手术操作编码|其他手术)'
+            r'(?:编码|代码)?[\s_]*(\d+)名称$')
+
+        def _groups(pat):
+            g, matched = {}, []
+            for col in df.columns:
+                m = pat.match(str(col).strip())
+                if m:
+                    g.setdefault(int(m.group(1)), []).append(col)
+                    matched.append(col)
+            return g, matched
+
+        def _fold(target_code, target_name, code_groups, name_groups):
+            code_cols = [c for i in sorted(code_groups) for c in code_groups[i]]
+            name_cols = [c for i in sorted(name_groups) for c in name_groups[i]]
+            base_code = df[target_code] if target_code in df.columns else None
+            base_name = df[target_name] if target_name in df.columns else None
+            folded_codes, folded_names = [], []
+            for i in range(len(df)):
+                cvals, nvals = [], []
+                if base_code is not None:
+                    bv = str(base_code.iat[i])
+                    if bv not in ('', 'nan', 'None'):
+                        cvals.append(bv)
+                for c in code_cols:
+                    v = str(df[c].iat[i])
+                    if v not in ('', 'nan', 'None'):
+                        cvals.append(v)
+                for c in name_cols:
+                    v = str(df[c].iat[i])
+                    if v not in ('', 'nan', 'None'):
+                        nvals.append(v)
+                if base_name is not None:
+                    bv = str(base_name.iat[i])
+                    if bv not in ('', 'nan', 'None'):
+                        nvals.append(bv)
+                folded_codes.append('|'.join(dict.fromkeys(cvals)))
+                folded_names.append('|'.join(dict.fromkeys(nvals)))
+            df[target_code] = folded_codes
+            df[target_name] = folded_names
+            return [c for c in code_cols + name_cols if c in df.columns]
+
+        df = df.copy()
+        dcg, dnm = _groups(diag_code_re)
+        dng, dnn = _groups(diag_name_re)
+        ocg, onm = _groups(oprn_code_re)
+        ong, onn = _groups(oprn_name_re)
+        dropped = []
+        if dcg or dng:
+            dropped += _fold('related_diag_code', 'related_diag_name', dcg, dng)
+        if ocg or ong:
+            dropped += _fold('related_oprn_code', 'related_oprn_name', ocg, ong)
+        if dropped:
+            df = df.drop(columns=dropped)
+        return df
     
     @staticmethod
     def _safe_int(value) -> int:
@@ -772,18 +1068,51 @@ class LocalDirectoryGenerator:
         # 器官移植（实体器官/造血干细胞）：按手术码前缀精确判定。注意临床分类中
         # 「移植」一词极广（角膜/皮瓣/骨/腱/冠脉旁路等均含“移植”），故只用实体
         # 器官移植的稳定前缀，避免误伤组织移植。
+        # ① 先期分组·器官移植（实体器官/造血干细胞）：依据《函》4956–4963 列出的
+        #   **精确手术操作编码**（不含角膜/皮瓣/骨/腱/冠脉旁路等组织移植）。
+        #   匹配规则见 _op_in_priority_set：精确命中，或记录码去 x 扩展后的基础码
+        #   命中白名单中的基础型码（如 55.6100 命中 55.6100x001）。
         self._priority_transplant_ops = {
-            "55.6", "55.69",          # 肾移植
-            "50.51", "50.59",          # 肝移植
-            "37.51",                  # 心脏移植
-            "33.5",                   # 肺移植
-            "52.8",                   # 胰腺移植
-            "46.97",                  # 小肠/肠移植
-            "41.0", "41.04", "41.05", "41.06", "41.07", "41.08", "41.09",  # 造血干细胞移植
+            # 4956 心肺移植 33.6x00
+            "33.6",
+            # 4957 心脏移植 37.5100/37.5100x001
+            "37.5100", "37.5100x001",
+            # 4958 胰腺移植 52.8000/52.8200/52.8300
+            "52.8000", "52.8200", "52.8300",
+            # 4959 肾移植 55.6100/55.6901
+            "55.6100", "55.6901",
+            # 4960 肺移植 33.5000/33.5000x001/33.5100/33.5200
+            "33.5000", "33.5000x001", "33.5100", "33.5200",
+            # 4961 非同胞全相合异基因造血干细胞移植 41.0200/41.0800x001
+            "41.0200", "41.0800x001",
+            # 4962 同胞全相合异基因造血干细胞移植 41.0300/41.0500/41.0600
+            "41.0300", "41.0500", "41.0600",
+            # 4963 自体骨髓/造血干细胞移植 41.0000/41.0100/41.0401/41.0701/41.0900
+            "41.0000", "41.0100", "41.0401", "41.0701", "41.0900",
         }
-        # 呼吸循环支持：ECMO/体外循环 39.6x、CRRT 39.95x、呼吸机 96.7x、
-        # 无创通气 93.9x（睡眠呼吸暂停 G47.3 不属先期）、IABP 主动脉内球囊反搏 37.6x
-        self._priority_life_support_ops = {"39.6", "39.95", "96.7", "93.9", "37.6"}
+        # ① 先期分组·呼吸循环支持：依据《函》4964–4968 列出的**精确手术操作编码**，
+        #   **严格只看手术操作、不考虑诊断**。重要：
+        #   - 4956–4968 **未列**无创通气(93.9x)/IABP(37.6x)/普通血液透析(39.9500)/
+        #     呼吸机治疗[小于96小时](96.7101)/**单独出现的 CRRT(39.9500x007)**，
+        #     故这些均不属先期分组；
+        #   - 仅含 ECMO(39.6500)/全人工心脏(37.5200x001)/有创呼吸机[≥96小时](96.7201)/
+        #     人工肝(50.9200x001) 四个**单独**先期组；
+        #   - CRRT(39.9500x007) 在国家目录 4956–4968 中**无单独组**，仅作为 4966 组合组
+        #     的"相关手术"出现，须与 96.7201 同时存在才归先期组（见下方 _priority_combined_966_*）。
+        #   - 注：96.7101(呼吸机治疗[小于96小时]) 非《函》先期分组码，移除以免误判。
+        self._priority_life_support_ops = {
+            "39.6500",        # 4964 ECMO（《函》）
+            "37.5200x001",    # 4965 全人工心脏植入术
+            "96.7201",        # 4967 有创呼吸机支持[大于等于96小时]（单独先期组）
+            "50.9200x001",    # 4968 人工肝治疗
+        }
+        # 4966 组合组（严格依据《函》4966 行）：该目录行 **主要手术操作编码=96.7201
+        # 且 相关手术操作编码=39.9500x007 两列都不为空**，按国家目录约定此即 **且(AND)** ——
+        # 必须 有创呼吸机[≥96小时](96.7201) **与** CRRT(39.9500x007) 同时出现才归 4966；
+        # 二者缺一不可，单独出现各自归上述单独组(4967 呼吸机 / 基本规则 中的 CRRT)。
+        # 判定纯看手术操作，不考虑诊断。
+        self._priority_combined_966_vent = "96.7201"
+        self._priority_combined_966_crrt = "39.9500x007"
 
         # ③ 诊断辅助细分·结核耐药拓展码（默认内置《函》明确清单；
         #   仍可由 data/dip30_grouping_rules.json 的 tb_drug_resistance_ext 追加）
@@ -842,33 +1171,43 @@ class LocalDirectoryGenerator:
             属低出生体重(<2500g)，按 年龄分桶 + 出生体重分桶 分组
         """
         diag = self._clean_str(main_diag_code).upper()
-        ops = [self._norm_op_code(main_oprn_code), self._norm_op_code(related_oprn_code)]
+        # 手术码保留 x 扩展（不用 _norm_op_code，后者会去 x 导致 CRRT 与血液透析混淆）；
+        # 统一小写以匹配白名单中的小写 x 扩展码，且保证下游 _norm_op_code 能正确去扩展
+        ops = [self._clean_str(main_oprn_code).lower(), self._clean_str(related_oprn_code).lower()]
         ops = [o for o in ops if o]
 
-        # 器官移植（实体器官/造血干细胞）：手术码前缀精确匹配，不区分主要诊断
+        # 器官移植（实体器官/造血干细胞）：按《函》4956–4963 精确手术码判定，不区分主要诊断
         for op in ops:
-            if any(op.startswith(p) for p in self._priority_transplant_ops):
+            if self._op_in_priority_set(op, self._priority_transplant_ops):
                 return f"PRI|TRANSPLANT|{op}"
 
-        # 呼吸循环支持：ECMO/CRRT/呼吸机/无创通气/IABP，不区分主要诊断
+        # 4966 组合组：有创呼吸机[≥96小时](96.7201) 且 CRRT(39.9500x007) 必须同时出现，
+        # 才归为 4966；任一单独出现则归各自单独组（呼吸循环支持）。判定纯看手术操作。
+        _has_vent_combined = any(
+            self._op_in_priority_set(o, {self._priority_combined_966_vent}) for o in ops)
+        _has_crrt_combined = any(
+            self._op_in_priority_set(o, {self._priority_combined_966_crrt}) for o in ops)
+        if _has_vent_combined and _has_crrt_combined:
+            return f"PRI|COMBINED|{self._priority_combined_966_vent}+{self._priority_combined_966_crrt}"
+
+        # 呼吸循环支持（单独组）：按《函》4964–4968 精确手术码判定，不区分主要诊断
         for op in ops:
-            if any(op.startswith(p) for p in self._priority_life_support_ops):
+            if self._op_in_priority_set(op, self._priority_life_support_ops):
                 return f"PRI|LIFESUPPORT|{op}"
 
-        # 低出生体重儿：不区分主要诊断，依靠 年龄(天) + 新生儿出生体重(g) 分组
-        # 仅当 年龄不足1周岁 且 出生体重属低出生体重(<2500g) 时进入先期分组，
-        # 避免与 ③ 烧伤等婴儿病种冲突（正常体重婴儿不占先期分组）。
-        if self._is_under_one_year(age, day_age, birth_date, admission_date):
-            if Decimal("0") < birth_weight < Decimal(str(self.LBW_BIRTH_WEIGHT_THRESHOLD)):
-                # 对齐国家目录库先期 LBW：仅 <29天(≤28天) 进入，按出生体重档位取权威 DIP 码
-                days = self._age_in_days(day_age, birth_date, admission_date)
-                if days is not None and days <= 28:
-                    if getattr(self, 'national_directory', None) is not None and getattr(self, '_nat_lbw', None):
-                        dip = self._lbw_dip_for(birth_weight)
-                        if dip:
-                            return dip
-                    weight_bucket = self._lbw_weight_bucket(birth_weight)
-                    return f"PRI|LBW|新生儿期|{weight_bucket}"
+        # 低出生体重儿（4969–4973）：主诊断前三位(P07) + 天龄(<29天) + 出生体重 共同判定，
+        # 严格对齐国家目录库 P07-01..05。其判定方式（看诊断+天龄+体重）与器官移植/呼吸循环
+        # 支持（只看手术操作）不同，须严格参考国家目录库，不可混用。
+        if self._extract_icd3(main_diag_code) == "P07":
+            days = self._age_in_days(day_age, birth_date, admission_date)
+            # 国家目录 P07-01..05 年龄阈值为 <29天（新生儿期）
+            if days is not None and days < 29 and Decimal("0") < birth_weight < Decimal(str(self.LBW_BIRTH_WEIGHT_THRESHOLD)):
+                if getattr(self, 'national_directory', None) is not None and getattr(self, '_nat_lbw', None):
+                    dip = self._lbw_dip_for(birth_weight)
+                    if dip:
+                        return dip
+                band = self._lbw_weight_band_label(birth_weight)
+                return f"PRI|LBW|{band}"
 
         return None
 
@@ -914,6 +1253,25 @@ class LocalDirectoryGenerator:
             return "极低出生体重"
         if w < 2500:
             return "低出生体重"
+        return "正常体重"
+
+    @staticmethod
+    def _lbw_weight_band_label(weight_grams) -> str:
+        """低出生体重儿 5 档标签（严格对齐国家目录 P07-01..05 体重区间），用于未加载国家目录时的回退。"""
+        try:
+            w = float(weight_grams)
+        except Exception:
+            return "未知体重"
+        if w < 750:
+            return "超低出生体重<750"
+        if w < 1000:
+            return "超低出生体重750-999"
+        if w < 1500:
+            return "极低出生体重1000-1499"
+        if w < 2000:
+            return "较低出生体重1500-1999"
+        if w < 2500:
+            return "低出生体重2000-2499"
         return "正常体重"
 
     @staticmethod
@@ -1023,6 +1381,95 @@ class LocalDirectoryGenerator:
                 return b['dip']
         return ""
 
+    def _nat_dip_for_op(self, op_code: str) -> str:
+        """按手术操作码反查国家目录 DIP 码（先期分组·器官移植/呼吸循环支持：国家 DIP 以手术码为键）。
+
+        国家目录中移植/呼吸循环支持组以主要手术操作编码为分组键；本地先期分组键为
+        PRI|TRANSPLANT|{op} / PRI|LIFESUPPORT|{op}，需按手术码回查国家 DIP 码以对齐显示。
+        """
+        nd = getattr(self, 'national_directory', None)
+        if nd is None:
+            return ""
+        op = self._norm_op_code(op_code)
+        if not op:
+            return ""
+        for _, r in nd.iterrows():
+            nat_op_raw = r.get('主要手术操作编码', '')
+            nat_op_raw = "" if (nat_op_raw != nat_op_raw or nat_op_raw is None) else str(nat_op_raw)
+            if not nat_op_raw:
+                continue
+            for cand in self._split_codes(nat_op_raw):
+                if cand[:4] == op[:4] or op[:4] == cand[:4]:
+                    return str(r.get('DIP编码', '')).strip()
+        return ""
+
+    def _nat_dip_for_diag_oprn(self, diag_code: str, oprn_code: str) -> str:
+        """按 主要诊断(4位) + 主要手术操作 查国家目录 DIP 码（基本规则/并项规则层）。
+
+        匹配优先级（严格对齐国家目录，避免 x 扩展码被吞）：
+          1) 精确（含 x 扩展码）：如 39.9500x007(CRRT) 优先命中 N18.5-03，而非被
+             39.9500(血液透析) 的前4位碰撞误归 N18.5-01；
+          2) 去 x 基础码兜底：本地码无扩展时回退（如 55.6100 → 55.6100x001）；
+          3) 前4位前缀兜底：编码体系差异时的最后手段。
+        """
+        nd = getattr(self, 'national_directory', None)
+        if nd is None:
+            return ""
+        diag4 = self._extract_icd4(diag_code)
+        if not diag4:
+            return ""
+        op_full = LocalDirectoryGenerator._clean_str(oprn_code).lower()  # 保留 x 扩展
+        if not op_full:
+            return ""
+        op_base = re.sub(r'x\d+$', '', op_full, flags=re.IGNORECASE)
+        best_base = ""
+        for _, r in nd.iterrows():
+            nd_diag = self._extract_icd4(str(r.get('主要诊断编码', '')))
+            nd_op = LocalDirectoryGenerator._clean_str(r.get('主要手术操作编码', '')).lower()
+            if nd_diag != diag4 or not nd_op:
+                continue
+            if nd_op == op_full:
+                return str(r.get('DIP编码', '')).strip()   # 精确(含 x)命中即返回
+            if nd_op == op_base:
+                best_base = str(r.get('DIP编码', '')).strip()
+        if best_base:
+            return best_base
+        for _, r in nd.iterrows():
+            nd_diag = self._extract_icd4(str(r.get('主要诊断编码', '')))
+            nd_op = LocalDirectoryGenerator._clean_str(r.get('主要手术操作编码', '')).lower()
+            if nd_diag == diag4 and nd_op[:4] == op_base[:4]:
+                return str(r.get('DIP编码', '')).strip()
+        return ""
+
+    def _nat_dip_for_combined(self, diag_code: str, op1: str, op2: str) -> str:
+        """按 主要诊断(4位) + 双手术操作(均含) 查国家目录 DIP 码（先期组合组 4966：呼吸机≥96h + CRRT）。
+
+        4966 = 有创呼吸机[≥96小时](96.7201) 且 CRRT(39.9500x007) 同时存在。目录中 96.7201
+        实操码可能缺失，故尽力而为：扫描国家目录中主要手术操作编码同时含 op1 与 op2 的行；
+        命中（且主诊断匹配或为先期占位 A41.9/P07）则返回其 DIP 码，否则返回空（保留本地组合键）。
+        """
+        nd = getattr(self, 'national_directory', None)
+        if nd is None:
+            return ""
+        diag4 = self._extract_icd4(diag_code)
+        if not diag4:
+            return ""
+        o1 = self._norm_op_code(op1)
+        o2 = self._norm_op_code(op2)
+        if not o1 or not o2:
+            return ""
+        for _, r in nd.iterrows():
+            nd_op_raw = r.get('主要手术操作编码', '')
+            nd_op_raw = "" if (nd_op_raw != nd_op_raw or nd_op_raw is None) else str(nd_op_raw)
+            if not nd_op_raw:
+                continue
+            nd_op_norm = self._norm_op_code(nd_op_raw)
+            if o1 in nd_op_norm and o2 in nd_op_norm:
+                nd_diag = self._extract_icd4(str(r.get('主要诊断编码', '')))
+                if nd_diag == diag4 or nd_diag in ("A41.9", "P07"):
+                    return str(r.get('DIP编码', '')).strip()
+        return ""
+
     def _tb_op_set_for(self, cat, main_oprn, related_oprn):
         """按病例手术码反查国家目录结核手术变体 op_set（A15-A16 7 种 / A17 含腰椎穿刺 / 其他无手术）。"""
         codes = set()
@@ -1053,9 +1500,12 @@ class LocalDirectoryGenerator:
         return self._clinical_op_category.get(clinical, "")
 
     def _get_op_subtype(self, insurance_op_code: str) -> str:
-        """医保版手术码 -> 综合病种子组类型。介入治疗并入相关手术组。"""
+        """医保版手术码 -> 综合病种子组类型。介入治疗并入相关手术组。
+
+        四子组：保守治疗组（无手术操作/内科诊疗）/ 诊断性操作组 / 治疗性操作组 / 相关手术组。
+        """
         if not self._clean_str(insurance_op_code):
-            return "内科诊疗组"
+            return "保守治疗组"
         cat = self._get_op_category(insurance_op_code)
         if cat == "诊断性操作":
             return "诊断性操作组"
@@ -1110,6 +1560,31 @@ class LocalDirectoryGenerator:
             if self._clean_str(nat_op_raw) else [""]
         return local_norm in nat_candidates or local_bridge in nat_candidates
 
+    def _op_in_priority_set(self, op_code: str, codes: set) -> bool:
+        """先期分组手术白名单精确匹配（依据《函》4956–4968 列出的精确手术操作编码）。
+
+        匹配规则：
+          - 精确：记录手术码（保留 x 扩展）命中白名单某项；
+          - 基础型：去除 x 扩展后缀后的基础码命中白名单中的基础型码（如 55.6100
+            命中 55.6100x001）。白名单中带 x 的扩展型码（如 39.9500x007 CRRT）必须
+            精确命中，从而将普通血液透析 39.9500 排除在先期分组之外。
+        同时尝试医保版↔国临版桥接，兼容不同来源的手术码。
+        """
+        op = self._clean_str(op_code).lower()
+        if not op:
+            return False
+        cands = {op}
+        bridged = self._insurance_to_clinical.get(op) or self._insurance_to_clinical.get(op.upper())
+        if bridged:
+            cands.add(bridged)
+        for c in cands:
+            if c in codes:
+                return True
+            base = re.sub(r'x\d+$', '', c, flags=re.IGNORECASE)
+            if base != c and base in codes:
+                return True
+        return False
+
     @staticmethod
     def _extract_icd4(icd_code: str) -> str:
         """提取 ICD-10 主诊断 4 位码（类目+亚目，去除点号后的扩展码）。
@@ -1135,6 +1610,40 @@ class LocalDirectoryGenerator:
         code = code.split("x")[0] if "x" in code else code
         return code[:3] if len(code) >= 3 else code
 
+    def _resolve_category_name(self, diag3: str, candidates: List[Tuple[str, str]]) -> str:
+        """由 3 位类目码解析综合病种类目名称（优先 ICD-10 医保2.0 版权威类目名称）。
+
+        优先级：
+          1) ICD-10 医保2.0 版类目名称映射（data/icd10_category_map.json，权威来源）；
+          2) 组内存在「编码恰好等于 3 位类目码」的候选 -> 取其名称；
+          3) 否则取所有去重名称中最短者（类目级名称通常短于亚目级，如「肺炎」<「急性肺炎」）；
+          4) 兜底返回 3 位码本身。
+        candidates: List[(诊断码, 诊断名称)]，来自组内合并的各初级组首条记录（仅作回退）。
+        """
+        diag3 = LocalDirectoryGenerator._clean_str(diag3).upper()
+        if not diag3:
+            return ""
+        # 1) 权威类目名称（ICD-10 医保2.0 版）
+        if diag3 in self._icd10_category_map:
+            return self._icd10_category_map[diag3]
+        # 2-3) 回退：从组内病例推导（ICD 字典无 3 位类目行时的兜底）
+        exact = None
+        names = set()
+        for code, name in candidates:
+            code = LocalDirectoryGenerator._clean_str(code).upper()
+            name = LocalDirectoryGenerator._clean_str(name)
+            if not name:
+                continue
+            if code == diag3:
+                exact = name
+            names.add(name)
+        if exact:
+            return exact
+        if names:
+            # 最短名称优先；同名长度并列时按字母序稳定取首个
+            return min(names, key=lambda n: (len(n), n))
+        return diag3
+
     def _refine_core_group_key(
         self,
         main_diag_code: str,
@@ -1155,17 +1664,23 @@ class LocalDirectoryGenerator:
         顺序：① 先期分组 → ② 并项规则 → ③ 诊断辅助细分 → ④ 基本规则（兜底）。
         每条记录仅命中最高优先级的一层，得到唯一成组键（与后续测算顺序一致）。
 
-        ① 先期分组：器官移植 / 呼吸循环支持 / 低出生体重儿等，多不区分主要诊断，
-           依靠主要手术操作（见 _detect_priority）。
-        ② 并项规则：
-           - 诊断并项：指定诊断族在 3 位码下归并（如心绞痛 I20.x -> I20）；
-           - 手操并项（诊断维度）：指定诊断下忽略具体术式整体并项（如 D18.0 血管瘤）；
-           - 手操并项（术式维度）：个体术式 -> 规范并项码（如肾动脉支架+球囊联合）。
-        ③ 诊断辅助细分（肿瘤放化疗靶向免疫 / 结核耐药 / 烧伤）：
-           与第三步「触发式辅助分型」(严重程度/年龄/ICU/CCI) 机制/阶段/字段/输出均不同，
-           此处仅做核心病种成组层细分，产出独立核心病种组（各自 RW）。
-        ④ 基本规则：主要诊断 4 位码 + 主要手术操作（+ 相关手术操作）。
+        ⚠️ 新版（3.0 版分组方案）：四层不再靠「3 位类目推断」，而是直接调用
+        NationalDirectoryV30 按 XQ/BX/FZ/JC 分段查表，命中者返回**方案序号**（全局唯一）
+        作为成组键；未命中（含国家目录缺失该组合）回落内置基本规则键，保证不丢病例。
         """
+        # 优先走《3.0 版分组方案》国家目录引擎（XQ/BX/FZ/JC 分段查表）
+        if self._nat_engine is not None:
+            m = self._nat_engine.match(
+                main_diag_code, main_oprn_code, related_oprn_code, related_diag_code,
+                day_age=day_age, birth_weight=birth_weight, age=age,
+                birth_date=birth_date, admission_date=admission_date,
+            )
+            if m is not None:
+                self._nat_seq_meta[m.seq] = m
+                return m.seq, m.layer
+
+        # ---- 回落：未加载国家目录引擎 或 国家目录未命中该组合 ----
+        # 沿用内置种子规则做四层判定（向后兼容，保证任何病例都能成组）。
         diag4 = self._extract_icd4(main_diag_code)
         diag3 = self._extract_icd3(main_diag_code)
 
@@ -1178,7 +1693,6 @@ class LocalDirectoryGenerator:
             return pri, "先期分组"
 
         # ② 并项规则
-        # 2a 诊断并项：指定诊断族用 3 位码归并（命中即属并项规则层）
         if diag3 in self._merge_diag_families:
             diag_key = diag3
             if main_oprn_code:
@@ -1186,10 +1700,8 @@ class LocalDirectoryGenerator:
                         if related_oprn_code else f"{diag_key}|{main_oprn_code}|"), "并项规则"
             return f"{diag_key}||", "并项规则"
         diag_key = diag4
-        # 2b 手操并项（诊断维度）：指定诊断下整体并项，忽略具体术式
         if self._clean_str(main_diag_code).upper() in self._op_merge_diag_set:
             return f"{diag4}|OPMERGE", "并项规则"
-        # 2c 手操并项（术式维度）：个体术式 -> 规范并项码（联合/相似并项，忽略相关手术）
         main_canon = self._op_merge_map.get(self._norm_op_code(main_oprn_code))
         rel_canon = self._op_merge_map.get(self._norm_op_code(related_oprn_code))
         if main_canon is not None or rel_canon is not None:
@@ -1197,8 +1709,6 @@ class LocalDirectoryGenerator:
             return f"{diag_key}|{canon}|", "并项规则"
 
         # ③ 诊断辅助细分（肿瘤放化疗靶向免疫 / 结核耐药 / 烧伤）
-        #   与第三步「触发式辅助分型」(严重程度/年龄/ICU/CCI) 机制/阶段/字段/输出均不同，
-        #   此处仅做核心病种成组层细分，产出独立核心病种组（各自 RW）。
         aux = self._refine_diagnostic_auxiliary(
             main_diag_code, main_oprn_code, related_oprn_code, related_diag_code,
             age=age, day_age=day_age, birth_date=birth_date, admission_date=admission_date,
@@ -1218,10 +1728,24 @@ class LocalDirectoryGenerator:
     # ======================================================================
     @staticmethod
     def _split_codes(code_str: str) -> List[str]:
-        """把 ';' / '、' / ',' / 空格 分隔的编码串拆成清大写的编码列表。"""
+        """把 '|' / ';' / '、' / ',' / '+' / 空格 分隔的编码串拆成清大写的编码列表。
+
+        规范多值分隔符为 '|'（与 4101A 解析器、数据库模型「多个用|分隔」约定一致）；
+        其余 ; 、 , + 空格 为历史/人工录入兼容。空串返回空列表。
+
+        ⚠️ 国家 DIP3.0 目录库编码语义约定（务必遵守）：
+          - '/' 表示 **或(OR)**：同一字段内 'A/B' = A 或 B（如 心脏移植 37.5100/37.5100x001）。
+          - '+' 表示 **且(AND)**：同一字段内 'A+B' = A 与 B 同时满足
+            （如 化疗+靶向 99.2503+99.2800x006，须记录同时有化疗与靶向）。
+          - 当一条目录行的『主要手术操作编码/名称』与『相关手术操作编码/名称』
+            两列**都不为空**时，含义同样是 **且(AND)**（如 4966 行：主要手术 96.7201
+            + 相关手术 39.9500x007，须两码同时出现才归该组）。
+        本函数仅做"切分"，不判定 OR/AND；调用方须据上述约定自行解释：
+        切出的多码若是 '+' 连接的，应视为 AND（下游逻辑需全部命中），而非任选其一。
+        """
         if not code_str:
             return []
-        return [c.strip().upper() for c in str(code_str).replace("；", ";")
+        return [c.strip().upper() for c in str(code_str).replace("|", ";").replace("；", ";")
                 .replace("、", ";").replace(",", ";").replace("+", ";").split(";")
                 if c.strip()]
 
@@ -1302,38 +1826,31 @@ class LocalDirectoryGenerator:
         age: int, day_age: int, birth_date: str, admission_date: str,
     ) -> Optional[str]:
         """③ 诊断辅助细分·烧伤类（依据《函》5016–5039）：先区分年龄，再按
-        烧伤程度(主诊断 T29/T30 名称中的 一度/二度/三度) + 面积(次要诊断 T31/T32
-        名称中的百分比区间) 分组。程度与面积均取自 ICD *名称*，不使用编码第4位。
+        烧伤程度+是否多部位(主诊断，来源 ICD-10 医保2.0 主诊断字典) + 面积(次要诊断
+        T31/T32 面积字典名称中的百分比区间) 分组。程度与面积均取自 ICD *名称*，不使用编码第4位。
 
+        主诊断字典（_burn_main_diag_dict，权威来源 data/burn_degree_dict.xlsx「烧伤程度」
+        sheet，216 条医保版2.0 编码，覆盖 T20–T25 各部位二度/三度/腐蚀伤 + T29 多部位 +
+        T30 未特指）：程度取 二度/三度，名称含「多处/多部位」→ 多部位、否则单部位；
+        一度(.0)与未特指程度码不在附件内 → 不进入字典（回落基本规则）。
         严格对齐《函》24 组（程度×面积×年龄），返回条目号(DIP 编码，如 "5018")；
-        非烧伤病种 / 一度·四度烧伤(《函》无对应组) 返回 None（回落基本规则）。
+        非烧伤病种 / 字典未命中 / 一度·四度(《函》无对应组) 返回 None（回落基本规则）。
         """
         diag = self._clean_str(main_diag_code).upper()
-        # 烧伤程度：主诊断命中 T29(多部位)/T30(单部位)，依据名称含 一度/二度/三度 判定
-        site = None
-        degree_level = None
-        main_name = ""
+        # 烧伤程度+是否多部位：主诊断命中「主诊断字典」（来源 ICD-10 医保2.0，精确匹配叶子码）
+        main_entry = None
         for c in self._split_codes(diag):
-            if c.startswith("T29") or c.startswith("T30"):
-                main_name = self._icd10_burn_name(c)
-                if "多处" in main_name or "多部位" in main_name:
-                    site = "多部位"
-                else:
-                    site = "单部位"
-                if "四度" in main_name:
-                    degree_level = "四度"
-                elif "三度" in main_name:
-                    degree_level = "三度"
-                elif "二度" in main_name:
-                    degree_level = "二度"
-                elif "一度" in main_name:
-                    degree_level = "一度"
+            entry = self._burn_main_diag_lookup(c)
+            if entry is not None:
+                main_entry = entry
                 break
-        if site is None or not main_name or degree_level is None:
+        if main_entry is None:
             return None
+        degree_level = main_entry["degree"]   # 二度 / 三度（字典仅含此两档）
+        site = main_entry["site"]             # 单部位 / 多部位
 
         # 《函》5016-5039 仅定义 二度/三度 两档（含多部位）；一度·四度无对应组 → 不进入细分
-        if degree_level in ("一度", "四度"):
+        if degree_level not in ("二度", "三度"):
             return None
         degree_cat = ("多部位" if site == "多部位" else "") + degree_level  # 多部位二度/三度, 二度/三度
 
@@ -1341,10 +1858,10 @@ class LocalDirectoryGenerator:
         age_years = self._calc_age_years(age, day_age, birth_date, admission_date)
         age_cat = "<18岁" if age_years < self.BURN_AGE_ADULT else "≥18岁"
 
-        # 面积：次要诊断含 T31/T32，取名称中的百分比区间 → 年龄分档面积分类
+        # 面积：次要诊断含 T31/T32（面积字典），取名称中的百分比区间 → 年龄分档面积分类
         area_cat = "10%以下"  # 缺省（保守最小档）：次要诊断无 T31/T32 时归最小面积档
         for c in self._split_codes(related_diag_code):
-            if c.startswith("T31") or c.startswith("T32"):
+            if c.startswith(self.BURN_AREA_PREFIXES):
                 rel_name = self._icd10_burn_name(c)
                 if rel_name:
                     area_cat = self._burn_area_from_name(rel_name, age_cat)
@@ -1434,13 +1951,31 @@ class LocalDirectoryGenerator:
         mixed_subtype: str,
         records: List[Dict] = None,
         layer: str = "",
+        diag3: str = "",
     ) -> DiseaseGroup:
-        """从聚合统计构造 DiseaseGroup（含 CCI / 严重度 / 裁剪 / 类别 / 成组层次 字段）。"""
+        """从聚合统计构造 DiseaseGroup（含 CCI / 严重度 / 裁剪 / 类别 / 成组层次 字段）。
+
+        综合病种(MIXED)名称按 DIP3.0 规范格式化为「类目名称 + 子组类型」
+        （如「肺炎保守治疗组」「肺炎相关手术组」），便于目录库直观区分治疗方式。
+        """
+        if group_type == GroupType.MIXED:
+            cat_name = (
+                stats.get('category_name')
+                or LocalDirectoryGenerator._clean_str(stats.get('main_diag_name'))
+                or (diag3 if diag3 else '未分类')
+            )
+            disease_name = f"{cat_name}{mixed_subtype}"
+            main_diag_name = f"{cat_name}{mixed_subtype}"
+            main_diag_code = diag3 or stats.get('main_diag_code', '')
+        else:
+            disease_name = self._generate_disease_name(stats)
+            main_diag_name = stats.get('main_diag_name', '')
+            main_diag_code = stats.get('main_diag_code', '')
         group = DiseaseGroup(
             disease_code=key.replace('|', '_'),
-            disease_name=self._generate_disease_name(stats),
-            main_diag_code=stats.get('main_diag_code', ''),
-            main_diag_name=stats.get('main_diag_name', ''),
+            disease_name=disease_name,
+            main_diag_code=main_diag_code,
+            main_diag_name=main_diag_name,
             main_oprn_code=stats.get('main_oprn_code', ''),
             main_oprn_name=stats.get('main_oprn_name', ''),
             related_oprn_code=stats.get('related_oprn_code', ''),
@@ -1462,15 +1997,58 @@ class LocalDirectoryGenerator:
         )
         # 组级查字典：CCI 评分 + 疾病严重程度（规范逻辑，字典为权威数据源）
         diags = list(stats.get('diag_codes', set()))
-        group.cci_score = Decimal(str(self._compute_group_cci(diags)))
+        group.cci_score = Decimal(str(self._compute_group_cci(diags, stats.get('main_diag_code', ''))))
         sev_level, sev_type = self._compute_group_severity(diags)
         group.severity_level = sev_level
         group.severity_type = sev_type
-        # ①/③ 严格对齐：若组键即国家目录 DIP 编码，直接回填权威码
-        if key in getattr(self, '_nat_dip_codes', set()):
+
+        # ---- 国家目录元数据回填 ----
+        # ① 命中《3.0 版分组方案》引擎（XQ/BX/FZ/JC 查表）→ 方案序号权威，回填 DIP 编码/基层标记
+        meta = getattr(self, '_nat_seq_meta', {}).get(key)
+        if meta is not None:
+            group.national_seq = meta.seq
+            group.national_dip_code = meta.dip_code
+            group.national_matched = True
+            group.is_grassroot = meta.is_grassroot
+            # 国家目录分组名称优先（烧伤/肿瘤/结核等 FZ 组的权威命名）
+            if meta.group_name:
+                group.disease_name = meta.group_name
+        # ② 旧路径兼容：若组键即「烧伤函条目号」权威 DIP 码，直接回填
+        elif key in getattr(self, '_nat_dip_codes', set()):
             group.national_dip_code = key
             group.national_matched = True
         return group
+
+    # ------------------------------------------------------------------
+    # 监护病房住院天数（重症）判断补充规则
+    #   国家 DIP3.0 规范未明确监护病房住院天数如何分型，故补充两种业务判定方式
+    #   （self.icu_days_rule 切换，见 ICU_BED_FEE_CODES / ICU_DAYS_RULE_OPTIONS）。
+    #   两种判断均以「特级护理天数(spga_nurscare_days)」作为监护病房住院天数；
+    #   与既有 icu_days(如 icu_dura/ICU天数) 取大值，不丢失任何显式提供的监护天数。
+    # ------------------------------------------------------------------
+    def _derive_icu_days(self, icu_days_base: int, nurscare_days: int,
+                         ward_type: str, charge_codes) -> int:
+        """由业务补充规则推导监护病房住院天数(icu_days)。
+
+        Args:
+            icu_days_base: 既有监护天数（来自 icu_dura / ICU天数 / 重症监护天数 等字段）
+            nurscare_days: 特级护理天数（spga_nurscare_days）
+            ward_type:     重症监护病房类型（scs_cutd_ward_type）
+            charge_codes:  收费项目编码集合（可迭代 / 集合 / 列表；判断1 用）
+        Returns:
+            推导后的监护病房住院天数（int）
+        """
+        rule = self.icu_days_rule
+        if rule == "ward_type":
+            severe = bool(ward_type)
+        else:  # 默认 'charge_item'（判断1）
+            severe = bool(
+                {str(c).strip().upper() for c in (charge_codes or [])}
+                & self.ICU_BED_FEE_CODES
+            )
+        if severe and nurscare_days > 0:
+            return max(icu_days_base, nurscare_days)
+        return icu_days_base
 
     def cluster_records_to_groups(self, df: pd.DataFrame) -> Dict[str, DiseaseGroup]:
         """
@@ -1482,7 +2060,7 @@ class LocalDirectoryGenerator:
              得到唯一核心成组键；组内病例数 >= 地方临界值(threshold) 的依次形成地方
              核心病种（与国家目录库对照、顺序一致）。
           二、综合病种：未达到核心病种临界值的病例，按手术操作属性分 4 子组
-             （内科诊疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组），
+             （保守治疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组），
              叠加主诊断 3 位码类目聚类，并做质量控制（剔除仍低于阈值者、
              标记组内变异系数过高的组）。
          三、各组住院总费用做极端病例裁剪（2.5% / 97.5% 分位数），
@@ -1502,6 +2080,10 @@ class LocalDirectoryGenerator:
         self.total_original_cases = 0
         self.total_trimmed_cases = 0
         self.excluded_cases = 0
+        # 不纳入分组（主要诊断）剔除清单复位 + 国家目录元数据复位
+        self.excluded_diag_records = []
+        self.excluded_diag_cases = 0
+        self._nat_seq_meta = {}
 
         # ---------- 第一阶段：核心病种初级聚类（四层顺序成组） ----------
         primary = defaultdict(lambda: {
@@ -1519,18 +2101,40 @@ class LocalDirectoryGenerator:
             'diag_codes': set(),
         })
 
-        for _, row in df.iterrows():
-            main_diag = self._clean_str(row.get('main_diag_code'))
-            main_oprn = self._clean_str(row.get('main_oprn_code'))
-            related_oprn = self._clean_str(row.get('related_oprn_code'))
-            related_diag = self._clean_str(row.get('related_diag_code'))
-            day_age = self._safe_int(row.get('day_age', 0))
-            birth_weight = self._safe_decimal(row.get('birth_weight', 0))
-            age = self._safe_int(row.get('age', 0))
-            birth_date = self._clean_str(row.get('birth_date'))
-            admission_date = self._clean_str(row.get('admission_date'))
+        # ---- 行为保持优化：iterrows -> itertuples（仅改变遍历方式，逐字段一一对应，
+        #      测算逻辑与结果完全不变；详见 scripts/perf_stability_check.py 指纹校验）----
+        _total_rows = len(df)
+        _ci = {name: i for i, name in enumerate(df.columns)}
+        def _cell(row, name, default=''):
+            i = _ci.get(name)
+            return row[i] if i is not None else default
+        # 仅对大数据量打印进度（小样本/测试保持静默，避免干扰输出）
+        _progress_step = max(1, _total_rows // 20) if _total_rows > 0 else 1
+
+        for _pos, _row in enumerate(df.itertuples(index=False, name=None), 1):
+            main_diag = self._clean_str(_cell(_row, 'main_diag_code'))
+            main_oprn = self._clean_str(_cell(_row, 'main_oprn_code'))
+            related_oprn = self._clean_str(_cell(_row, 'related_oprn_code'))
+            related_diag = self._clean_str(_cell(_row, 'related_diag_code'))
+            day_age = self._safe_int(_cell(_row, 'day_age', 0))
+            birth_weight = self._safe_decimal(_cell(_row, 'birth_weight', 0))
+            age = self._safe_int(_cell(_row, 'age', 0))
+            birth_date = self._clean_str(_cell(_row, 'birth_date'))
+            admission_date = self._clean_str(_cell(_row, 'admission_date'))
 
             if not main_diag:
+                continue
+
+            # 不纳入分组·主要诊断：命中即剔除，不参与分组测算（另出剔除清单）
+            if self._nat_engine is not None and self._nat_engine.is_excluded_diag(main_diag):
+                self.excluded_diag_records.append({
+                    '主要诊断编码': main_diag,
+                    '主要诊断名称': self._clean_str(_cell(_row, 'main_diag_name')),
+                    '主要手术操作编码': main_oprn,
+                    '主要手术操作名称': self._clean_str(_cell(_row, 'main_oprn_name')),
+                    '总费用': self._clean_str(_cell(_row, 'total_cost', 0)),
+                })
+                self.excluded_diag_cases += 1
                 continue
 
             # 四层顺序成组：先期分组 → 并项规则 → 诊断辅助细分 → 基本规则
@@ -1541,7 +2145,7 @@ class LocalDirectoryGenerator:
                 birth_date=birth_date, admission_date=admission_date,
             )
 
-            cost = Decimal(str(row.get('total_cost', 0)))
+            cost = Decimal(str(_cell(_row, 'total_cost', 0)))
             stats = primary[cluster_key]
             stats['case_count'] += 1
             stats['layer'] = layer
@@ -1552,28 +2156,44 @@ class LocalDirectoryGenerator:
                 'main_oprn_code': main_oprn,
                 'related_diag_code': related_diag,
                 'total_cost': cost,
-                'drug_cost': self._safe_decimal(row.get('drug_cost', 0)),
-                'treatment_cost': self._safe_decimal(row.get('treatment_cost', 0)),
-                'los': self._safe_int(row.get('los', 0)),
-                'age': self._safe_int(row.get('age', 0)),
-                'day_age': self._safe_int(row.get('day_age', 0)),
-                'icu_days': self._safe_int(row.get('icu_days', 0)),
-                'discharge_status': self._clean_str(row.get('discharge_status')),
+                'drug_cost': self._safe_decimal(_cell(_row, 'drug_cost', 0)),
+                'treatment_cost': self._safe_decimal(_cell(_row, 'treatment_cost', 0)),
+                'los': self._safe_int(_cell(_row, 'los', 0)),
+                'age': self._safe_int(_cell(_row, 'age', 0)),
+                'day_age': self._safe_int(_cell(_row, 'day_age', 0)),
+                # 监护病房住院天数(重症)：业务补充规则推导（收费项目/病房类型 + 特级护理天数）
+                'icu_days': self._derive_icu_days(
+                    self._safe_int(_cell(_row, 'icu_days', 0)),
+                    self._safe_int(_cell(_row, 'spga_nurscare_days', 0)),
+                    self._clean_str(_cell(_row, 'scs_cutd_ward_type')),
+                    set(str(c).strip().upper() for c in
+                        (str(_cell(_row, 'charge_item_codes', '')).split('|')
+                         if isinstance(_cell(_row, 'charge_item_codes', ''), str)
+                         else list(_cell(_row, 'charge_item_codes', [])))
+                        if str(c).strip()),
+                ),
+                'discharge_status': self._clean_str(_cell(_row, 'discharge_status')),
+                # 医疗机构等级（基层病种遴选：统计基层机构病例占比）
+                'hospital_level': self._clean_str(_cell(_row, 'hospital_level', '')),
             })
 
             if not stats['main_diag_code']:
                 stats['main_diag_code'] = main_diag
-                stats['main_diag_name'] = self._clean_str(row.get('main_diag_name'))
+                stats['main_diag_name'] = self._clean_str(_cell(_row, 'main_diag_name'))
                 stats['main_oprn_code'] = main_oprn
-                stats['main_oprn_name'] = self._clean_str(row.get('main_oprn_name'))
+                stats['main_oprn_name'] = self._clean_str(_cell(_row, 'main_oprn_name'))
                 stats['related_oprn_code'] = related_oprn
-                stats['related_oprn_name'] = self._clean_str(row.get('related_oprn_name'))
+                stats['related_oprn_name'] = self._clean_str(_cell(_row, 'related_oprn_name'))
                 stats['related_diag_code'] = related_diag
 
             # 采集诊断码集合（用于组级 CCI / 疾病严重程度查字典）
+            # 多值其他诊断（'|' 分隔，兼容 ; , 、 + 空格）逐码纳入，确保合并症 CCI 算全（B1 修正延伸）
             stats['diag_codes'].add(main_diag)
-            if related_diag:
-                stats['diag_codes'].add(related_diag)
+            for d in self._split_codes(related_diag):
+                stats['diag_codes'].add(d)
+
+            if _total_rows >= 1000 and (_pos % _progress_step == 0 or _pos == _total_rows):
+                print(f"  [聚类] {_pos}/{_total_rows} ({_pos * 100 // _total_rows}%)", flush=True)
 
         # 初级组 -> 核心病种（达阈值） / 未达阈值者进入综合病种池
         groups: Dict[str, DiseaseGroup] = {}
@@ -1583,7 +2203,9 @@ class LocalDirectoryGenerator:
             case_count = stats['case_count']
 
             if case_count >= self.threshold:
-                # 核心病种：与地方临界值(threshold)对照，达阈值者依次形成地方核心病种
+                # 核心病种：达地方临界值(threshold)者形成地方核心病种。
+                # 四层（先期分组/并项规则/诊断辅助细分/基本规则）一律受阈值约束：
+                # 未达阈值的病种折叠进入综合病种池（与国家目录口径一致，本地病例不足不强行独立成组）。
                 kept_costs, trimmed, lb, ub = self._trim_group_costs(stats['costs'])
                 kept_count = len(kept_costs)
                 total_cost = sum(kept_costs, Decimal('0'))
@@ -1623,10 +2245,11 @@ class LocalDirectoryGenerator:
             'related_oprn_code': '',
             'related_oprn_name': '',
             'diag_codes': set(),
+            'cat_candidates': [],   # [(诊断码, 诊断名称)] 用于推导 3 位类目名称
         })
 
         for rec in subthreshold_records:
-            subtype = self._get_op_subtype(rec['main_oprn'])   # 内科/诊断性/治疗性/相关手术
+            subtype = self._get_op_subtype(rec['main_oprn'])   # 保守治疗/诊断性/治疗性/相关手术
             diag3 = self._extract_icd3(rec['main_diag'])        # 主诊断 3 位码（类目）
             sec_key = f"{subtype}|{diag3}"
             s = secondary[sec_key]
@@ -1638,6 +2261,7 @@ class LocalDirectoryGenerator:
                 s['main_oprn_code'] = rec['main_oprn']
                 s['main_oprn_name'] = rec['main_oprn_name']
             s['diag_codes'] |= rec['diag_codes']
+            s['cat_candidates'].append((rec['main_diag'], rec['main_diag_name']))
 
         for key, stats in secondary.items():
             case_count = stats['case_count']
@@ -1651,12 +2275,14 @@ class LocalDirectoryGenerator:
 
             subtype = key.split('|')[0]
             diag3 = key.split('|')[1]
+            category_name = self._resolve_category_name(diag3, stats['cat_candidates'])
+            stats['category_name'] = category_name
 
             group = self._build_group(
                 key=f"MIX_{subtype}_{diag3}", stats=stats, case_count=case_count,
                 avg_cost=avg_cost, kept_count=kept_count, lb=lb, ub=ub, trimmed=trimmed,
                 group_type=GroupType.MIXED, mixed_subtype=subtype,
-                layer="综合病种",
+                layer="综合病种", diag3=diag3,
             )
 
             # 综合病种质量控制：
@@ -1705,19 +2331,37 @@ class LocalDirectoryGenerator:
     def apply_auxiliary_typing(
         self,
         groups: Dict[str, DiseaseGroup],
-        min_total_cases: int = 15,
+        min_total_cases: int = 10,
         min_type_cases: int = 5,
         cv_improvement_pct: float = 0.20,
+        cv_mode: str = "absolute",
+        cv_threshold: float = 0.6,
+        tcm_disease_codes: Optional[set] = None,
+        bed_day_disease_codes: Optional[set] = None,
     ) -> Dict[str, DiseaseGroup]:
         """对核心病种应用辅助分型（DIP3.0 第三步）。
 
         对每个核心病种逐条分型，评估四个维度（严重程度/年龄特征/ICU天数/CCI）
-        的触发条件（规范：病例数阈值、分型病例数阈值、CV 改善≥20%）：
-          - 上年度病例数（以当前组病例数代理）>= min_total_cases
-          - 某分型等级病例数 >= min_type_cases
-          - 分型后组内变异系数下降 >= cv_improvement_pct
-        若多个维度触发，取 CV 改善最大者；将该核心病种拆分为该维度下的若干
+        的触发条件：
+          - 核心病种病例数 > min_total_cases
+          - 某分型等级（子型）病例数 > min_type_cases
+          - CV 条件（由 cv_mode 决定口径）：
+            * ``"absolute"``（默认，测试阶段）：拆分后组内加权 CV < cv_threshold
+            * ``"improvement"``（正式使用，数据量大时）：CV 改善率 >= cv_improvement_pct
+        B7 多规则竞争：若多个维度触发，取「触发系数（mj/M）最高」的维度拆分
+        （触发系数并列时取 CV 改善更大者）；将该核心病种拆分为该维度下的若干
         子组（各自独立病种行，保留父代码）。未触发则保持原组不变。
+
+        B5 分值费用标准：高费用判定基准 = 未测算辅助分型的核心病种的平均费用
+            （即该核心病种成组后的 group.avg_cost，记为 mi）。本地目录测算不
+            计算真实点值，故分值费用标准直接取 mi，而非任意平均费用倍数。
+        B6 范围控制：中医优势病种 / 床日病种不纳入辅助分型（标记或码集命中即跳过）。
+
+        参数说明：
+          - cv_mode="absolute"：当前测试阶段默认，与 Web 门控口径一致
+            （子型费用绝对 CV < 0.6 才测算）。
+          - cv_mode="improvement"：后期正式使用、数据量大时切换
+            （拆分后 CV 相对改善 >= 20% 才测算）。
         """
         cci_calc = CCICalculator()
         sev_calc = DiseaseSeverityClassifier()
@@ -1726,6 +2370,17 @@ class LocalDirectoryGenerator:
 
         new_groups: Dict[str, DiseaseGroup] = {}
         self.auxiliary_trigger_report: List[Dict] = []
+
+        # 顺序护栏：辅助分型（第三步）必须发生在四层成组之后。
+        # 每个核心病种都应已带 grouping_layer（先期/并项/诊断辅助细分/基本规则），
+        # 否则说明调用顺序错误（辅助分型被提前执行），立即报错以阻止回归。
+        for _k, _g in groups.items():
+            if _g.group_type == GroupType.CORE and not _g.excluded:
+                if _g.grouping_layer not in LocalDirectoryGenerator.LAYER_ORDER:
+                    raise RuntimeError(
+                        f"辅助分型顺序错误：核心病种 {_g.disease_code} 缺少分组层次"
+                        f"(grouping_layer={_g.grouping_layer!r})，辅助分型必须在四层成组之后执行"
+                    )
 
         for key, group in groups.items():
             # 仅对核心病种、未剔除者做辅助分型（综合病种不拆分）
@@ -1738,14 +2393,29 @@ class LocalDirectoryGenerator:
                 new_groups[key] = group
                 continue
 
+            # B6：中医优势病种 / 床日病种不纳入辅助分型范围（标记或码集命中即跳过）
+            if (group.is_tcm_advantage or group.is_bed_day
+                    or (tcm_disease_codes and group.main_diag_code in tcm_disease_codes)
+                    or (bed_day_disease_codes and group.main_diag_code in bed_day_disease_codes)):
+                group.auxiliary_split = False
+                new_groups[key] = group
+                continue
+
+            # B5：分值费用标准 = 未测算辅助分型的核心病种平均费用（mi = group.avg_cost）
+            cost_standard = group.avg_cost
+
             # 逐条分型，得到各维度下按等级归集的成员
             dim_levels = self._classify_members(
-                members, group, cci_calc, sev_calc, age_calc, icu_calc
+                members, group, cci_calc, sev_calc, age_calc, icu_calc,
+                cost_standard=cost_standard,
             )
             all_costs = [float(m['total_cost']) for m in members]
             cv_before = self._compute_cv(all_costs)
+            # B2：M = 该病种全部病例平均住院费用（调节系数/触发系数分母）
+            M = sum(all_costs) / len(all_costs) if all_costs else 0.0
 
             best_dim = None
+            best_trigger = 0.0          # 触发系数（mj/M）最高者胜出（B2）
             best_improvement = 0.0
             best_levels = None
             for dim, levels in dim_levels.items():
@@ -1756,21 +2426,36 @@ class LocalDirectoryGenerator:
                     (len(info['members']) for info in levels.values()), default=0
                 )
                 triggered = (
-                    group.case_count >= min_total_cases
-                    and max_bucket_count >= min_type_cases
-                    and improvement >= cv_improvement_pct
+                    group.case_count > min_total_cases
+                    and max_bucket_count > min_type_cases
+                    and (
+                        cv_after < cv_threshold
+                        if cv_mode == "absolute"
+                        else improvement >= cv_improvement_pct
+                    )
                 )
+                # B2：触发系数 = 各子组 mj/M 的最大值（mj=子组平均住院费用）
+                trig = 0.0
+                if M > 0:
+                    for info in levels.values():
+                        trig = max(trig, self._mean_cost(info['members']) / M)
                 self.auxiliary_trigger_report.append({
                     'disease_code': group.disease_code,
+                    'main_diag_code': group.main_diag_code,
                     'disease_name': group.disease_name,
                     'dimension': dim,
                     'cv_before': round(cv_before, 4),
                     'cv_after': round(cv_after, 4),
                     'cv_improvement': round(improvement, 4),
+                    'cv_mode': cv_mode,
+                    'cv_threshold': cv_threshold if cv_mode == "absolute" else cv_improvement_pct,
+                    'trigger_coefficient': round(trig, 4),
                     'max_bucket_case_count': max_bucket_count,
                     'triggered': '是' if triggered else '否',
                 })
-                if triggered and improvement > best_improvement:
+                if triggered and (trig > best_trigger or
+                                 (trig == best_trigger and improvement > best_improvement)):
+                    best_trigger = trig
                     best_improvement = improvement
                     best_dim = dim
                     best_levels = levels
@@ -1780,36 +2465,46 @@ class LocalDirectoryGenerator:
                 new_groups[key] = group
                 continue
 
-            # 触发：按 best_dim 拆分；低频等级（<min_type_cases）并入“其他(低频)”
+            # 触发：按 best_dim 拆分；低频等级（<=min_type_cases）并入"其他(低频)"
             group.auxiliary_split = True
             main_levels = {
                 lv: info for lv, info in best_levels.items()
-                if len(info['members']) >= min_type_cases
+                if len(info['members']) > min_type_cases
             }
             small = [info for lv, info in best_levels.items()
-                     if len(info['members']) < min_type_cases]
+                     if len(info['members']) <= min_type_cases]
             if small:
                 merged_members = []
                 for info in small:
                     merged_members.extend(info['members'])
+                mj = self._mean_cost(merged_members)
                 main_levels['其他(低频)'] = {
-                    'members': merged_members, 'coeff': Decimal('1.0')
+                    'members': merged_members,
+                    'coeff': Decimal(str(mj / M)) if M > 0 else Decimal('1.0'),
                 }
 
             for level, info in main_levels.items():
+                # B2：调节系数 = mj / M（mj=该子组平均住院费用，M=病种全样本平均）
+                mj = self._mean_cost(info['members'])
+                coeff = Decimal(str(mj / M)) if M > 0 else Decimal('1.0')
                 sub = self._build_auxiliary_subgroup(
                     parent=group, dimension=best_dim, level=level,
-                    members=info['members'], coeff=info['coeff'],
+                    members=info['members'], coeff=coeff,
+                    trigger_coefficient=Decimal(str(best_trigger)),
                 )
                 new_groups[f"{group.disease_code}_{best_dim}_{level}"] = sub
 
         return new_groups
 
     def _classify_members(
-        self, members, group, cci_calc, sev_calc, age_calc, icu_calc
+        self, members, group, cci_calc, sev_calc, age_calc, icu_calc,
+        cost_standard: Optional[object] = None,
     ) -> Dict[str, Dict]:
         """逐条成员分型，返回 {维度: {等级: {'members':[...], 'coeff':x}}}。"""
         avg_cost = group.avg_cost
+        # B5：高费用判定基准 = 分值费用标准（RW×点值）；缺省回退病种平均费用
+        if cost_standard is None:
+            cost_standard = avg_cost
         is_tumor = self._is_tumor_diagnosis(group.main_diag_code)
         dims = {'严重程度': {}, '年龄特征': {}, 'ICU天数': {}, 'CCI': {}}
 
@@ -1824,7 +2519,7 @@ class LocalDirectoryGenerator:
             )
             # 严重程度（恶性/非恶性分流）
             if is_tumor:
-                sev = sev_calc.classify_malignant_tumor(rec, avg_cost, avg_cost)
+                sev = sev_calc.classify_malignant_tumor(rec, avg_cost, cost_standard)
             else:
                 sev = sev_calc.classify_non_malignant(rec)
             self._bucket(dims['严重程度'], sev['level'], sev['coefficient'], m)
@@ -1845,9 +2540,13 @@ class LocalDirectoryGenerator:
             else:
                 self._bucket(dims['ICU天数'], "无ICU", Decimal('1.0'), m)
 
-            # CCI
-            diags = [d for d in (m['main_diag_code'], m['related_diag_code']) if d]
-            cci_level, cci_coeff = cci_calc.get_cci_level(cci_calc.calculate_cci(diags))
+            # CCI（B1 修正：仅使用其他诊断/相关诊断，不计入主诊断）
+            # 多值其他诊断（'|' 分隔等）逐码拆分，确保合并症 CCI 算全
+            related = m.get('related_diag_code') or ''
+            diags = self._split_codes(related)
+            cci_score = cci_calc.calculate_cci(diags)
+            cci_level, cci_coeff = cci_calc.get_cci_level(cci_score)
+            m['cci_score'] = cci_score
             self._bucket(dims['CCI'], cci_level, cci_coeff, m)
 
         return dims
@@ -1858,6 +2557,12 @@ class LocalDirectoryGenerator:
         if level not in d:
             d[level] = {'members': [], 'coeff': coeff}
         d[level]['members'].append(m)
+
+    @staticmethod
+    def _mean_cost(members: List[Dict]) -> float:
+        """子组平均住院费用 mj（B2：用于计算 mj/M 数据化系数）。"""
+        costs = [float(m['total_cost']) for m in members]
+        return sum(costs) / len(costs) if costs else 0.0
 
     def _cv_after_split(self, buckets: Dict[str, List[Dict]]) -> Tuple[float, None]:
         """拆分后组内（within-subgroup）变异系数：按 n×std / n×mean 加权。
@@ -1884,6 +2589,7 @@ class LocalDirectoryGenerator:
     def _build_auxiliary_subgroup(
         self, parent: DiseaseGroup, dimension: str, level: str,
         members: List[Dict], coeff: Decimal,
+        trigger_coefficient: Decimal = Decimal("1.0"),
     ) -> DiseaseGroup:
         """由父核心病种 + 某一辅助维度等级构造拆分出的子组。"""
         costs = [Decimal(str(m['total_cost'])) for m in members]
@@ -1913,6 +2619,7 @@ class LocalDirectoryGenerator:
             auxiliary_type=dimension,
             auxiliary_level=level,
             auxiliary_coefficient=coeff,
+            auxiliary_trigger_coefficient=trigger_coefficient,
             auxiliary_parent_code=parent.disease_code,
             auxiliary_split=False,
         )
@@ -1929,6 +2636,8 @@ class LocalDirectoryGenerator:
         else:
             sub.severity_level = parent.severity_level
             sub.severity_type = parent.severity_type
+        # 基层病种：父核心病种被拆分后不再单独输出，子组需继承基层属性
+        sub.is_grassroot = parent.is_grassroot
         return sub
     
     def _generate_disease_name(self, stats: Dict) -> str:
@@ -2001,6 +2710,91 @@ class LocalDirectoryGenerator:
         """
         return [g for g in mixed_groups if not g.excluded]
     
+    # ------------------------------------------------------------------
+    # 基层病种（《DIP3.0 技术规范（征求意见稿）》第三章第四节 / 第十九条）
+    #   定义：基层病种是核心病种中的一个类别。地方在适宜基层医疗机构开展且基层
+    #         具备诊治能力的病种中，选取诊断明确、治疗方案成熟、临床路径清晰、
+    #         医疗风险可控的一定数量病种，设为基层病种。
+    #   遴选原则：① 以常见病、多发病、慢性病为主；② 基层医疗机构病例占比较大；
+    #             ③ 医疗费用相对稳定，变异系数较低（如 CV 值不超过 0.7）。
+    #   分值设定：可不设医疗机构调节系数，即采用同一分值与医疗机构结算（同病同治同价）。
+    # ------------------------------------------------------------------
+    def select_grassroot_groups(
+        self,
+        groups: Dict[str, DiseaseGroup],
+    ) -> Dict[str, DiseaseGroup]:
+        """在本地核心病种中遴选基层病种，并留痕遴选依据（self.grassroot_report）。
+
+        口径（用户 2026-09-04 确认）：
+          候选池 = 《分组方案》基层病种 sheet 名录（成组时已初判 group.is_grassroot）
+          校验项 = ① 属核心病种 ② 基层机构病例占比 ≥ grassroot_min_basic_ratio
+                   ③ 组内 CV（裁剪后，与综合病种同口径）≤ grassroot_max_cv
+          三项全通过才最终设为基层病种；未通过者置 False 并记录原因。
+
+        Args:
+            groups: 聚类成组结果（含核心病种与综合病种）
+
+        Returns:
+            已回填 is_grassroot 的病种组字典
+        """
+        self.grassroot_report = []
+        if not self.enable_grassroot:
+            return groups
+
+        for group in groups.values():
+            # 基层病种是核心病种中的一个类别；综合病种不参与遴选
+            if group.group_type != GroupType.CORE:
+                group.is_grassroot = False
+                continue
+
+            # 非候选：未命中《分组方案》基层病种名录
+            if not group.is_grassroot:
+                continue
+
+            members = group.member_records or []
+            total = len(members)
+            basic = sum(
+                1 for m in members
+                if str(m.get('hospital_level', '')).strip() in self.grassroot_levels
+            )
+            ratio = (basic / total) if total else 0.0
+
+            # 组内 CV：与综合病种同口径，取极端病例裁剪后的费用计算
+            costs = [Decimal(str(m.get('total_cost', 0))) for m in members]
+            kept, _trimmed, _lb, _ub = self._trim_group_costs(costs)
+            cv = self._compute_cv(kept)
+
+            reasons = []
+            if total <= 0:
+                reasons.append("无成员记录")
+            if ratio < self.grassroot_min_basic_ratio:
+                reasons.append(
+                    f"基层机构病例占比 {ratio:.2%} < {self.grassroot_min_basic_ratio:.0%}"
+                )
+            if cv > self.grassroot_max_cv:
+                reasons.append(f"组内CV {cv:.3f} > {self.grassroot_max_cv}")
+
+            group.is_grassroot = not reasons
+            self.grassroot_report.append({
+                '病种代码': group.disease_code,
+                '病种名称': group.disease_name,
+                '主要诊断编码': group.main_diag_code,
+                '主要诊断名称': group.main_diag_name,
+                '主要手术操作编码': group.main_oprn_code,
+                '主要手术操作名称': group.main_oprn_name,
+                '分组层次': group.grouping_layer,
+                '国家目录方案序号': group.national_seq,
+                '病例数': total,
+                '基层机构病例数': basic,
+                '基层机构病例占比': round(ratio, 4),
+                '组内CV(裁剪后)': round(cv, 4),
+                '占比阈值': self.grassroot_min_basic_ratio,
+                'CV阈值': self.grassroot_max_cv,
+                '是否入选': '是' if group.is_grassroot else '否',
+                '未入选原因': '；'.join(reasons),
+            })
+        return groups
+
     def calculate_all_disease_values(
         self,
         groups: List[DiseaseGroup],
@@ -2090,16 +2884,29 @@ class LocalDirectoryGenerator:
             matched = False
             national_info = {}
 
-            for _, nat_row in self.national_directory.iterrows():
-                nat_diag = str(nat_row.get('主要诊断编码', nat_row.get('main_diag_code', ''))).strip()
-                nat_diag4 = self._extract_icd4(nat_diag)
-                nat_oprn_raw = nat_row.get('主要手术操作编码', nat_row.get('main_oprn_code', ''))
-                nat_oprn_raw = "" if (nat_oprn_raw != nat_oprn_raw or nat_oprn_raw is None) else str(nat_oprn_raw)
+            # 并项规则(②)组：国家目录以「3 位类目码(无小数点)」表示并项家族，
+            # 与 ④ 基本规则 的 4 位码区分；并项已合并全部手术，故按 3 位类目直接匹配、
+            # 忽略手术操作，挂接该家族首个国目 DIP 码（代表此并项国目组）。
+            if group.grouping_layer == "并项规则":
+                g3 = self._extract_icd3(group.main_diag_code)
+                for _, nat_row in self.national_directory.iterrows():
+                    nat_diag = str(nat_row.get('主要诊断编码', '')).strip().upper()
+                    if nat_diag == g3:
+                        matched = True
+                        national_info = nat_row.to_dict()
+                        break
 
-                if nat_diag4 == group_diag4 and self._op_code_matches(group_oprn, nat_oprn_raw):
-                    matched = True
-                    national_info = nat_row.to_dict()
-                    break
+            if not matched:
+                for _, nat_row in self.national_directory.iterrows():
+                    nat_diag = str(nat_row.get('主要诊断编码', nat_row.get('main_diag_code', ''))).strip()
+                    nat_diag4 = self._extract_icd4(nat_diag)
+                    nat_oprn_raw = nat_row.get('主要手术操作编码', nat_row.get('main_oprn_code', ''))
+                    nat_oprn_raw = "" if (nat_oprn_raw != nat_oprn_raw or nat_oprn_raw is None) else str(nat_oprn_raw)
+
+                    if nat_diag4 == group_diag4 and self._op_code_matches(group_oprn, nat_oprn_raw):
+                        matched = True
+                        national_info = nat_row.to_dict()
+                        break
 
             # 回写到病种对象（供目录库导出展示）
             group.national_matched = matched
@@ -2167,8 +2974,19 @@ class LocalDirectoryGenerator:
         print(f"   极端病例裁剪: 裁剪前 {self.total_original_cases} 例, "
               f"剔除 {self.total_trimmed_cases} 例, 整体裁剪率 {self.overall_trim_rate*100:.2f}%")
 
-        # 3.5 核心病种辅助分型（第三步）：触发条件评估与拆分
-        print("\n[3.5/6] 核心病种辅助分型（触发条件评估）...")
+        # 3.2 基层病种遴选（《技术规范》第三章第四节：基层病种是核心病种中的一个类别）
+        #     严格排在四层成组之后、辅助分型之前——遴选指标（病例数/基层占比/组内CV）
+        #     以完整核心病种为口径测算，不受后续辅助分型拆分影响。
+        print("\n[3.2/6] 基层病种遴选（候选=《分组方案》基层病种名录；校验=核心病种+基层占比+CV）...")
+        groups = self.select_grassroot_groups(groups)
+        _gr_picked = sum(1 for r in self.grassroot_report if r['是否入选'] == '是')
+        print(f"   基层病种候选: {len(self.grassroot_report)} 个，入选: {_gr_picked} 个")
+
+        # 3.5 核心病种辅助分型（第三步）：严格排在「①先期→②并项→③诊断辅助细分→
+        #     ④基本规则」四层成组（步骤3）之后执行。辅助分型是对已成型核心病种的
+        #     触发式细分，不得穿插或提前于四层成组；拆出的子组继承父层 grouping_layer，
+        #     从而保持「四层 + 综合病种」的整体输出框架。
+        print("\n[3.5/6] 核心病种辅助分型（触发条件评估，必须在四层成组之后）...")
         groups = self.apply_auxiliary_typing(groups)
         print(f"   辅助分型后病种组合数: {len(groups)}（含拆分出的辅助子组）")
         
@@ -2231,6 +3049,29 @@ class LocalDirectoryGenerator:
             match_path = output_path / "与国家目录库匹配结果.xlsx"
             match_df.to_excel(match_path, index=False, engine='openpyxl')
             print(f"   匹配结果: {match_path}")
+
+        # 基层病种目录（规范：可不设医疗机构调节系数，同病同治同价）
+        grassroot_df = self._export_grassroot_directory(all_groups)
+        if not grassroot_df.empty:
+            gr_path = output_path / "本地DIP目录库_基层病种.xlsx"
+            grassroot_df.to_excel(gr_path, index=False, engine='openpyxl')
+            print(f"   基层病种目录: {gr_path}（{len(grassroot_df)} 个）")
+        else:
+            print("   基层病种目录: 本次无入选的基层病种（详见遴选依据表）")
+
+        # 基层病种遴选依据表（候选池逐条：病例数/基层机构占比/组内CV/是否入选/未入选原因）
+        if self.grassroot_report:
+            sel_df = self._export_grassroot_selection()
+            sel_path = output_path / "基层病种遴选依据表.xlsx"
+            sel_df.to_excel(sel_path, index=False, engine='openpyxl')
+            print(f"   基层病种遴选依据表: {sel_path}")
+
+        # 不纳入分组·主要诊断：导出剔除清单（命中病例不参与分组测算）
+        if self.excluded_diag_records:
+            excl_df = pd.DataFrame(self.excluded_diag_records)
+            excl_path = output_path / "不纳入分组_主要诊断剔除清单.xlsx"
+            excl_df.to_excel(excl_path, index=False, engine='openpyxl')
+            print(f"   不纳入分组剔除清单: {excl_path}（{self.excluded_diag_cases} 例）")
         
         print("\n" + "=" * 60)
         print("本地DIP目录库生成完成！")
@@ -2269,7 +3110,9 @@ class LocalDirectoryGenerator:
                 '组内变异系数': round(group.cv, 4),
                 '质控剔除': '是' if group.excluded else '否',
                 '国家目录匹配': '是' if group.national_matched else '否',
+                '国家目录方案序号': group.national_seq,
                 '国家DIP编码': group.national_dip_code,
+                '基层病种': '是' if group.is_grassroot else '否',
                 '辅助分型维度': group.auxiliary_type,
                 '辅助分型等级': group.auxiliary_level,
                 '辅助调节系数': float(group.auxiliary_coefficient),
@@ -2305,7 +3148,9 @@ class LocalDirectoryGenerator:
                 '手术操作类别': group.op_category,
                 '组内变异系数': round(group.cv, 4),
                 '国家目录匹配': '是' if group.national_matched else '否',
+                '国家目录方案序号': group.national_seq,
                 '国家DIP编码': group.national_dip_code,
+                '基层病种': '是' if group.is_grassroot else '否',
                 '辅助分型维度': group.auxiliary_type,
                 '辅助分型等级': group.auxiliary_level,
                 '辅助调节系数': float(group.auxiliary_coefficient),
@@ -2340,6 +3185,49 @@ class LocalDirectoryGenerator:
             })
         return pd.DataFrame(data)
     
+    def _export_grassroot_directory(self, groups: List[DiseaseGroup]) -> pd.DataFrame:
+        """导出《本地DIP目录库_基层病种》：入选的基层病种及其分值。
+
+        分值口径（用户 2026-09-04 确认）：全样本合并测算——不分机构等级，采用
+        全市该病种全部病例（极端病例裁剪后）的次均费用参与统一分值计算，并按
+        规范「可不设医疗机构调节系数」以同一分值与各级医疗机构结算（同病同治同价）。
+        """
+        data = []
+        ordered = sorted([g for g in groups if g.is_grassroot], key=self._layer_sort_key)
+        for i, group in enumerate(ordered, 1):
+            members = group.member_records or []
+            basic = sum(
+                1 for m in members
+                if str(m.get('hospital_level', '')).strip() in self.grassroot_levels
+            )
+            ratio = (basic / len(members)) if members else 0.0
+            costs = [Decimal(str(m.get('total_cost', 0))) for m in members]
+            kept, _trimmed, _lb, _ub = self._trim_group_costs(costs)
+            data.append({
+                '序号': i,
+                '病种代码': group.disease_code,
+                '病种名称': group.disease_name,
+                '主要诊断编码': group.main_diag_code,
+                '主要诊断名称': group.main_diag_name,
+                '主要手术操作编码': group.main_oprn_code,
+                '主要手术操作名称': group.main_oprn_name,
+                '分组层次': group.grouping_layer,
+                '国家目录方案序号': group.national_seq,
+                '国家DIP编码': group.national_dip_code,
+                '病例数': group.case_count,
+                '基层机构病例数': basic,
+                '基层机构病例占比': round(ratio, 4),
+                '组内CV(裁剪后)': round(self._compute_cv(kept), 4),
+                '次均费用': round(float(group.avg_cost), 2),
+                '病种分值': round(float(group.disease_value), 4),
+                '医疗机构调节系数': '不设（同病同治同价）',
+            })
+        return pd.DataFrame(data)
+
+    def _export_grassroot_selection(self) -> pd.DataFrame:
+        """导出《基层病种遴选依据表》：候选池逐条的遴选过程与未入选原因。"""
+        return pd.DataFrame(self.grassroot_report)
+
     def _export_statistics(self, groups: List[DiseaseGroup]) -> pd.DataFrame:
         """导出统计报告"""
         core_count = sum(1 for g in groups if g.group_type == GroupType.CORE)
@@ -2348,10 +3236,16 @@ class LocalDirectoryGenerator:
         total_cost = sum(g.avg_cost * g.case_count for g in groups)
         avg_cost = total_cost / total_cases if total_cases > 0 else Decimal('0')
         
+        # 基层病种（《技术规范》运行质量监测指标之一：基层病种数量）
+        grassroot_count = sum(1 for g in groups if g.is_grassroot)
+        grassroot_cases = sum(g.case_count for g in groups if g.is_grassroot)
+
         stats = [
             {'统计项目': '病种总数', '数值': len(groups)},
             {'统计项目': '核心病种数', '数值': core_count},
             {'统计项目': '综合病种数', '数值': mixed_count},
+            {'统计项目': '基层病种数', '数值': grassroot_count},
+            {'统计项目': '基层病种覆盖病例数', '数值': grassroot_cases},
             {'统计项目': '总病例数', '数值': total_cases},
             {'统计项目': '总费用', '数值': round(float(total_cost), 2)},
             {'统计项目': '平均次均费用', '数值': round(float(avg_cost), 2)},

@@ -2,9 +2,11 @@
 DIP测算工具 - 中文图形化测试界面（完整版）
 包含：医保结算清单导入、分值测算、医院系数、辅助目录、费用异常处理、特例单议
 """
-import tkinter as tk
+import pytest
+tk = pytest.importorskip("tkinter")
 from tkinter import ttk, messagebox, filedialog
 import sys, os
+import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
@@ -866,6 +868,91 @@ class DIPCalculationApp:
                 self.dict_status.config(text=f"共 {len(data)} 条记录 | 每页 {self.page_size} 条 | 共 {self.total_pages} 页")
         except (ValueError, tk.TclError):
             pass
+
+
+def test_chinese_generate_records():
+    recs = generate_test_records()
+    assert len(recs) == 35
+    assert len([r for r in recs if r.main_diag_code == "I21.0"]) == 20
+    assert len([r for r in recs if r.main_diag_code == "K35"]) == 15
+
+
+def test_chinese_grouping_assigns_codes():
+    recs = generate_test_records()
+    engine = DIPGroupingEngine()
+    for r in recs:
+        g = engine.group_single_record(r)
+        assert g.disease_code
+        assert g.disease_name
+
+
+def test_chinese_full_pipeline():
+    recs = generate_test_records()
+
+    # 先按 GUI 实际流程做 DIP 分组（为每条记录赋 dip_disease_code）
+    engine = DIPGroupingEngine()
+    for r in recs:
+        g = engine.group_single_record(r)
+        r.dip_disease_code = g.disease_code
+        r.dip_disease_name = g.disease_name
+
+    # 1. 本地目录测算
+    local = LocalDirectoryScoreCalculator(
+        create_default_config()
+    ).batch_calculate_local_directory(recs)
+    assert sum(v["total_cases"] for v in local.values()) == 35
+
+    # 2. 分值测算
+    vr = DIPValueCalculator(
+        create_average_cost_config()
+    ).calculate_all_values(recs)
+    assert len(vr) == 2
+    for r in vr:
+        assert float(r.disease_value) > 0
+
+    # 3. 医院系数测算
+    agg = {}
+    for r in recs:
+        a = agg.setdefault(r.hospital_code, {
+            "hospital_code": r.hospital_code,
+            "hospital_name": r.hospital_name,
+            "hospital_level": r.hospital_level,
+            "total_cost": Decimal("0"),
+            "count": 0,
+        })
+        a["total_cost"] += r.total_cost
+        a["count"] += 1
+    for a in agg.values():
+        a["avg_cost"] = a["total_cost"] / a["count"]
+    hr = HospitalCoefficientSelector(
+        create_basic_bonus_config()
+    ).batch_calculate(list(agg.values()), recs)
+    assert len(hr) == 2
+    for h in hr:
+        assert float(h.final_coefficient) > 0
+
+    # 4. 辅助目录测算（子组级：核心病种 × 维度 × 子型）
+    ar = AuxiliaryDirectoryExporter().classify_records(recs)
+    # 合成数据下可能零子组（同质则不测算），仅在有子组时校验结构
+    for s in ar:
+        assert s.dimension and s.subtype
+        assert s.case_count > 0
+        assert s.coefficient > 0
+
+
+def test_chinese_app_builds():
+    pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:
+        pytest.skip("no display available")
+    try:
+        app = DIPCalculationApp(root)
+        assert app.tree1 is not None
+        assert app.tree2 is not None
+        assert app.tree3 is not None
+    finally:
+        root.destroy()
 
 
 def main():

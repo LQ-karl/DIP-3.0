@@ -19,7 +19,7 @@ def test_cci_calculator():
     cases = {
         ("I21.0", "E11.9"): 2,   # 心梗(1) + 糖尿病(1)
         ("J44.1", "I50.0"): 2,   # COPD(1) + 心衰(1)
-        ("C34.1", "E11.3"): 3,   # 肺癌(2) + 糖尿病并发症
+        ("C34.1", "E11.3"): 4,   # 肺癌(2) + 糖尿病(E11.3 命中 E11=2)
         ("K80.2",): 0,           # 胆囊结石（无 Charlson 组成部分）
         ("I10", "E11.9"): 1,     # 高血压(0) + 糖尿病(1)
     }
@@ -55,7 +55,8 @@ def test_severity_classifier():
         treatment_cost=Decimal("5000"), discharge_status="医嘱离院", los=15,
     )
     avg_cost = Decimal("30000")
-    result2 = classifier.classify_malignant_tumor(record2, avg_cost, avg_cost * 2)
+    # B5：高费用判定基准应为分值费用标准（此处 = 病种平均费用 avg_cost，而非 2×avg_cost）
+    result2 = classifier.classify_malignant_tumor(record2, avg_cost, avg_cost)
     # DIP3.0 规范 7 亚型：未命中死亡/高费用/转移/衰竭/器官病损 → 兜底"其他"
     assert result2['level'] == '其他', f"恶性肿瘤默认应判其他，实际 {result2['level']}"
     assert result2['coefficient'] == Decimal("1.0")
@@ -144,11 +145,13 @@ def test_auxiliary_calculator():
     # DIP3.0 规范 CCI 四级：1-2 分 = 一般，系数 1.1
     assert result['cci']['level'] == '一般'
     assert result['cci']['coefficient'] == Decimal("1.1")
-    assert result['severity']['level'] == '轻度'
+    # B3 权威字典：E11（糖尿病）属重度，故本例严重程度=重度、系数 1.3
+    assert result['severity']['level'] == '重度'
+    assert result['severity']['coefficient'] == Decimal("1.3")
     assert '老年' in result['age']['level'], f"72 岁应归老年，实际 {result['age']['level']}"
     assert result['age']['sub_level'] == '70-79岁'
-    assert result['max_coefficient'] == Decimal("1.1"), \
-        f"最高调节系数应为 1.1，实际 {result['max_coefficient']}"
+    assert result['max_coefficient'] == Decimal("1.3"), \
+        f"最高调节系数应为 1.3（CCI 1.1 / 重度 1.3 / 老年 1.1 取大），实际 {result['max_coefficient']}"
     assert isinstance(result['violation'], dict), "violation 应为 dict"
 
 

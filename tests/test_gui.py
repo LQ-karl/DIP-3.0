@@ -1,9 +1,11 @@
 """
 DIP测算工具 - 图形化测试界面
 """
-import tkinter as tk
+import pytest
+tk = pytest.importorskip("tkinter")
 from tkinter import ttk, messagebox, filedialog
 import sys, os
+import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
@@ -15,6 +17,68 @@ from src.core.calculation_config import (
 )
 from src.core.local_directory_score_configurable import LocalDirectoryScoreCalculator
 from src.models.models import MedicalRecord, HospitalCoefficient
+
+
+def make_test_records():
+    """生成测试病例数据（模块级，供无界面测试直接调用）"""
+    records = []
+
+    # 三级甲等医院 - 心内科
+    for i in range(20):
+        records.append(MedicalRecord(
+            record_id=f"REC{i+1:04d}",
+            settlement_id=f"SET{i+1:04d}",
+            patient_id=f"P{i+1:04d}",
+            visit_id=f"V{i+1:04d}",
+            hospital_code="H001",
+            hospital_name="市人民医院",
+            hospital_level="三级甲等",
+            main_diag_code="I21.0",
+            main_diag_name="急性心肌梗死",
+            related_diag_code="E11.9,I10",
+            main_oprn_code="36.07",
+            total_cost=Decimal(str(15000 + i * 500)),
+            drug_cost=Decimal(str(6000 + i * 200)),
+            material_cost=Decimal(str(4000 + i * 150)),
+            consumable_cost=Decimal(str(2000 + i * 100)),
+            exam_cost=Decimal(str(1500 + i * 50)),
+            treatment_cost=Decimal(str(1000 + i * 30)),
+            nursing_cost=Decimal(str(500 + i * 20)),
+            admission_date="2024-01-15",
+            discharge_date="2024-01-27",
+            los=12,
+            discharge_status="治愈",
+            dip_disease_code="I21-1"
+        ))
+
+    # 二级甲等医院 - 普外科
+    for i in range(15):
+        records.append(MedicalRecord(
+            record_id=f"REC{i+21:04d}",
+            settlement_id=f"SET{i+21:04d}",
+            patient_id=f"P{i+21:04d}",
+            visit_id=f"V{i+21:04d}",
+            hospital_code="H002",
+            hospital_name="区中心医院",
+            hospital_level="二级甲等",
+            main_diag_code="K35.9",
+            main_diag_name="急性阑尾炎",
+            main_oprn_code="47.0",
+            total_cost=Decimal(str(10000 + i * 400)),
+            drug_cost=Decimal(str(3000 + i * 150)),
+            material_cost=Decimal(str(2500 + i * 100)),
+            consumable_cost=Decimal(str(1500 + i * 80)),
+            exam_cost=Decimal(str(1000 + i * 40)),
+            treatment_cost=Decimal(str(800 + i * 25)),
+            nursing_cost=Decimal(str(400 + i * 15)),
+            admission_date="2024-02-10",
+            discharge_date="2024-02-18",
+            los=8,
+            discharge_status="治愈",
+            dip_disease_code="K35-1"
+        ))
+
+    return records
 
 
 class DIPCalculationGUI:
@@ -32,65 +96,9 @@ class DIPCalculationGUI:
     
     def generate_test_records(self):
         """生成测试病例数据"""
-        records = []
-        
-        # 三级甲等医院 - 心内科
-        for i in range(20):
-            records.append(MedicalRecord(
-                record_id=f"REC{i+1:04d}",
-                settlement_id=f"SET{i+1:04d}",
-                patient_id=f"P{i+1:04d}",
-                visit_id=f"V{i+1:04d}",
-                hospital_code="H001",
-                hospital_name="市人民医院",
-                hospital_level="三级甲等",
-                main_diag_code="I21.0",
-                main_diag_name="急性心肌梗死",
-                related_diag_code="E11.9,I10",
-                main_oprn_code="36.07",
-                total_cost=Decimal(str(15000 + i * 500)),
-                drug_cost=Decimal(str(6000 + i * 200)),
-                material_cost=Decimal(str(4000 + i * 150)),
-                consumable_cost=Decimal(str(2000 + i * 100)),
-                exam_cost=Decimal(str(1500 + i * 50)),
-                treatment_cost=Decimal(str(1000 + i * 30)),
-                nursing_cost=Decimal(str(500 + i * 20)),
-                admission_date="2024-01-15",
-                discharge_date="2024-01-27",
-                los=12,
-                discharge_status="治愈",
-                dip_disease_code="I21-1"
-            ))
-        
-        # 二级甲等医院 - 普外科
-        for i in range(15):
-            records.append(MedicalRecord(
-                record_id=f"REC{i+21:04d}",
-                settlement_id=f"SET{i+21:04d}",
-                patient_id=f"P{i+21:04d}",
-                visit_id=f"V{i+21:04d}",
-                hospital_code="H002",
-                hospital_name="区中心医院",
-                hospital_level="二级甲等",
-                main_diag_code="K35.9",
-                main_diag_name="急性阑尾炎",
-                main_oprn_code="47.0",
-                total_cost=Decimal(str(10000 + i * 400)),
-                drug_cost=Decimal(str(3000 + i * 150)),
-                material_cost=Decimal(str(2500 + i * 100)),
-                consumable_cost=Decimal(str(1500 + i * 80)),
-                exam_cost=Decimal(str(1000 + i * 40)),
-                treatment_cost=Decimal(str(800 + i * 25)),
-                nursing_cost=Decimal(str(400 + i * 15)),
-                admission_date="2024-02-10",
-                discharge_date="2024-02-18",
-                los=8,
-                discharge_status="治愈",
-                dip_disease_code="K35-1"
-            ))
-        
-        return records
-    
+        return make_test_records()
+
+
     def setup_ui(self):
         """设置UI界面"""
         # 创建主框架
@@ -319,6 +327,35 @@ class DIPCalculationGUI:
                 for key, value in stats.items():
                     if key != 'score':
                         self.detail_text.insert(tk.END, f"    {key}: {value}\n")
+
+
+def test_gui_batch_calculation():
+    recs = make_test_records()
+    assert len(recs) == 35
+    calc = LocalDirectoryScoreCalculator(create_default_config())
+    results = calc.batch_calculate_local_directory(recs)
+    assert set(results.keys()) == {"I21-1", "K35-1"}
+    assert sum(v["total_cases"] for v in results.values()) == 35
+    for v in results.values():
+        assert float(v["final_score"]) > 0
+        assert float(v["hospital_coefficient"]) > 0
+
+
+def test_gui_tree_populated():
+    pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:
+        pytest.skip("no display available")
+    try:
+        app = DIPCalculationGUI(root)
+        children = app.result_tree.get_children()
+        assert len(children) == 2
+        for c in children:
+            vals = app.result_tree.item(c, "values")
+            assert float(vals[2]) > 0  # 最终分值
+    finally:
+        root.destroy()
 
 
 def main():

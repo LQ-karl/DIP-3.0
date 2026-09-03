@@ -11,15 +11,60 @@ from typing import List, Dict, Tuple, Optional
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 from ..models.models import MedicalRecord, DiseaseGroup
+
+
+@dataclass
+class AuxiliarySubgroup:
+    """辅助分型子组（核心病种 × 维度 × 子型 的一行，子组级输出，而非逐病例）。
+
+    仅当核心病种组内存在明显临床复杂程度或资源消耗差异时才生成。
+
+    闸门与竞争口径严格贴合 DIP3.0 §5.2：
+      - 组内费用变异系数偏大（cv_before >= 阈值，默认 0.7）；
+      - 经某维度分型后组内费用 CV 下降明显（reduction >= 20%）；
+      - 触发系数 = 该维度子型最大 mj/M，维度竞争取触发系数最高者胜出。
+    """
+    disease_code: str
+    disease_name: str
+    dimension: str          # CCI / 疾病严重程度 / 年龄特征 / 重症监护
+    subtype: str           # 该维度下的子型标签（level，可含 sub_level）
+    case_count: int        # 子组病例数
+    avg_cost: Decimal     # 子组平均费用 mj
+    coefficient: Decimal   # 辅助分型调节系数：CCI 查表，其余 = mj / M
+    cv_before: float       # 分型前（整个核心病种组）费用变异系数 CV
+    cv_after: float        # 分型后（沿该维度拆分）组内费用变异系数 CV（池化）
+    cv_reduction: float    # (cv_before - cv_after) / cv_before，下降幅度
+    trigger_coefficient: Decimal  # 该维度触发系数 = 子型最大 mj / M
+    is_winning_dimension: bool = False  # 该维度是否经竞争胜出（实际应用的维度）
+    is_other: bool = False # 是否低频合并组（其他）
+
+    def to_dict(self) -> Dict:
+        return {
+            "核心病种编码": self.disease_code,
+            "核心病种名称": self.disease_name,
+            "分型维度": self.dimension,
+            "亚型": self.subtype,
+            "病例数": self.case_count,
+            "子组均费": f"¥{float(self.avg_cost):,.2f}",
+            "辅助分型系数": f"{float(self.coefficient):.4f}",
+            "触发系数(mj/M)": f"{float(self.trigger_coefficient):.4f}",
+            "组内CV(分型前)": f"{self.cv_before:.3f}",
+            "组内CV(分型后)": f"{self.cv_after:.3f}",
+            "CV下降幅度": f"{self.cv_reduction:.1%}",
+            "竞争胜出维度": "是" if self.is_winning_dimension else "否",
+            "低频合并": "是" if self.is_other else "否",
+        }
 
 
 class CCICalculator:
     """Charlson合并症指数(CCI)计算器"""
     
-    # CCI评分标准
-    CCI_SCORES = {
+    # 仅当权威 CCI.xlsx 缺失时的兜底（标准 Charlson 17 项核心，3 位前缀权重）；
+    # 正式测算应以 data/CCI.xlsx（按 ICD10 code → 得分）为准。
+    _CCI_FALLBACK = {
         # 心肌梗死 (1分)
         "I21": 1, "I22": 1, "I23": 1, "I24": 1, "I25": 1,
         # 充血性心力衰竭 (1分)
@@ -72,66 +117,84 @@ class CCICalculator:
         "B20": 6, "B21": 6, "B22": 6, "B23": 6, "B24": 6,
     }
     
-    def __init__(self):
-        pass
-    
-    def calculate_cci(self, diagnoses: List[str]) -> int:
+    def __init__(self, cci_file: Optional[str] = None):
+        from pathlib import Path
+        from ..utils.paths import get_data_dir
+        path = Path(cci_file) if cci_file else (get_data_dir() / "CCI.xlsx")
+        if path.exists():
+            self._cci_3, self._cci_4 = self._load_cci(path)
+        else:
+            import warnings
+            warnings.warn(
+                f"CCI 权威字典缺失({path})，回退内置 Charlson 17 项核心；"
+                f"正式测算应配置 data/CCI.xlsx"
+            )
+            self._cci_3 = dict(self._CCI_FALLBACK)
+            self._cci_4 = {}
+
+    @staticmethod
+    def _load_cci(path) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """从权威 CCI.xlsx 加载权重字典。
+
+        - 列：ICD10 code / Charlson component / 得分
+        - 4 位码（如 E10.3）与 3 位前缀（如 E10）分别建索引，便于 calculate_cci 优先 4 位匹配
+        - '得分'为空的码（无权重）按用户要求不纳入计算
         """
-        计算CCI分数
-        
-        Args:
-            diagnoses: 诊断代码列表（ICD-10）
-            
-        Returns:
-            CCI总分
+        df = pd.read_excel(path, sheet_name=0)
+        s3: Dict[str, float] = {}
+        s4: Dict[str, float] = {}
+        for _, row in df.iterrows():
+            raw = str(row.get("ICD10 code", "")).strip()
+            if not raw or raw.lower() == "nan":
+                continue
+            w = row.get("得分")
+            if w is None or pd.isna(w):
+                continue
+            try:
+                w = float(w)
+            except (TypeError, ValueError):
+                continue
+            norm = raw.upper().replace(".", "")
+            p3 = norm[:3]
+            s3[p3] = max(s3.get(p3, 0.0), w)
+            if len(norm) >= 4:
+                s4[norm[:4]] = max(s4.get(norm[:4], 0.0), w)
+        return s3, s4
+
+    @staticmethod
+    def _split_codes(code_str) -> List[str]:
+        """把 '|' / ';' / '、' / ',' / '+' / 空格 分隔的编码串拆成清大写的编码列表。
+
+        规范多值分隔符为 '|'（与 4101A 解析器、数据库模型「多个用|分隔」约定一致）；
+        其余分隔符为历史/人工录入兼容。空串返回空列表。
+        """
+        if not code_str:
+            return []
+        return [c.strip().upper() for c in str(code_str).replace("|", ";").replace("；", ";")
+                .replace("、", ";").replace(",", ";").replace("+", ";").split(";")
+                if c.strip()]
+
+    def calculate_cci(self, diagnoses: List[str]) -> int:
+        """计算 CCI 总分。
+
+        匹配规则：4 位码优先、3 位前缀回退；同一 3 位前缀（同类疾病）仅取最高权重分。
+        传入的每个诊断码若含多值分隔符（'|' 等），将兜底拆分为多个码后计分，
+        确保 4101A 等多值其他诊断的合并症 CCI 被正确累计（单值/空串结果不变）。
         """
         if not diagnoses:
             return 0
-        
-        total_score = 0
-        max_scores = {}  # 同类疾病取最高分
-        
-        for diag_code in diagnoses:
-            if not diag_code:
-                continue
-            
-            # 提取诊断代码前3-4位进行匹配
-            code_prefix = diag_code[:3]
-            code_4 = diag_code[:4] if len(diag_code) >= 4 else diag_code
-            
-            # 查找分数
-            score = 0
-            
-            # 先尝试4位码匹配（更精确）
-            if code_4 in self.CCI_SCORES:
-                score = self.CCI_SCORES[code_4]
-            # 再尝试3位码匹配
-            elif code_prefix in self.CCI_SCORES:
-                score = self.CCI_SCORES[code_prefix]
-            
-            if score > 0:
-                # 同类疾病只取最高分
-                category = self._get_disease_category(code_prefix)
-                if category not in max_scores or score > max_scores[category]:
-                    max_scores[category] = score
-        
-        total_score = sum(max_scores.values())
-        return total_score
-    
-    def _get_disease_category(self, code_prefix: str) -> str:
-        """获取疾病大类"""
-        if "I21" <= code_prefix <= "I25":
-            return "心肌梗死"
-        elif "I50" <= code_prefix <= "I50":
-            return "心力衰竭"
-        elif "I60" <= code_prefix <= "I69":
-            return "脑血管病"
-        elif "C00" <= code_prefix <= "C96":
-            return "肿瘤"
-        elif "E10" <= code_prefix <= "E13":
-            return "糖尿病"
-        else:
-            return code_prefix
+        max_by_cat: Dict[str, float] = {}
+        expanded: List[str] = []
+        for diag in diagnoses:
+            expanded.extend(self._split_codes(diag))
+        for diag in expanded:
+            c = diag.replace(".", "")
+            c3, c4 = c[:3], (c[:4] if len(c) >= 4 else c[:3])
+            w = self._cci_4.get(c4, self._cci_3.get(c3, 0.0))
+            if w > 0:
+                if c3 not in max_by_cat or w > max_by_cat[c3]:
+                    max_by_cat[c3] = w
+        return int(sum(max_by_cat.values()))
     
     def get_cci_level(self, cci_score: int) -> Tuple[str, Decimal]:
         """
@@ -158,9 +221,30 @@ class CCICalculator:
 class DiseaseSeverityClassifier:
     """疾病严重程度分型分类器"""
     
-    def __init__(self):
-        pass
-    
+    def __init__(self, assi_file: Optional[str] = None):
+        from pathlib import Path
+        from ..utils.paths import get_data_dir
+        path = Path(assi_file) if assi_file else (get_data_dir() / "中重度分型诊断.xlsx")
+        if path.exists():
+            self._severe_codes = self._load_assi_codes(path, "2")
+            self._organ_damage_codes = self._load_assi_codes(path, "1")
+            # 转移分型：DIP_ASSISTANT_CODE='3'（C77/C78/C79 继发性/远处转移部位，共288条）
+            self._metastasis_codes = self._load_assi_codes(path, "3")
+        else:
+            import warnings
+            warnings.warn(
+                f"中重度分型字典缺失({path})，回退内置少量码；"
+                f"正式测算应配置 data/中重度分型诊断.xlsx"
+            )
+            self._severe_codes = {"R57", "N17", "N19", "J96", "K72", "A40", "A41"}
+            self._organ_damage_codes = {
+                "I20", "I21", "I22", "I23", "I24", "I25", "I60", "I61", "I62",
+                "I63", "I64", "I65", "I66", "I67", "I68", "I69", "J85", "J86",
+                "K80", "K81", "K82", "K83", "K84", "K85", "K86", "K87", "N10",
+                "N11", "N12", "N13", "N14", "N15", "N16", "N17",
+            }
+            self._metastasis_codes = {"C77", "C78", "C79"}
+
     @staticmethod
     def _death_level(record: MedicalRecord) -> str:
         """死亡病例 IV 级：住院天数<3天 为 IV-A，≥3天 为 IV-B（DIP3.0 规范）。"""
@@ -210,18 +294,15 @@ class DiseaseSeverityClassifier:
                 "condition": "费用≥3倍标准，药品费占比≥50%"
             }
 
-        # (4) 肿瘤有转移或其他部位并发：次要诊断含其他部位恶性肿瘤，住院天数≥3天
-        if record.related_diag_code:
-            related_prefix = record.related_diag_code[:3]
-            main_prefix = record.main_diag_code[:3]
-            if ("C00" <= related_prefix <= "C96" and
-                related_prefix != main_prefix and
-                record.los >= 3):
+        # (4) 肿瘤转移/其他部位并发：次要诊断含恶性肿瘤（参考中重度字典转移分型 code=3，
+        #     或类目与主诊断不同的其他部位原发恶性肿瘤），且住院天数≥3天
+        if record.related_diag_code and record.los >= 3:
+            if self._has_metastasis(record.related_diag_code, record.main_diag_code):
                 return {
                     "type": "恶性肿瘤严重程度",
                     "level": "肿瘤转移并发",
                     "coefficient": Decimal("1.25"),
-                    "condition": "次要诊断含其他部位肿瘤，住院天数≥3天"
+                    "condition": "次要诊断含恶性肿瘤(转移分型/其他部位)，住院天数≥3天"
                 }
 
         # (5) 次要诊断属于"功能衰竭、休克、脓毒症"，住院天数≥3天
@@ -294,38 +375,61 @@ class DiseaseSeverityClassifier:
             "condition": "默认"
         }
     
+    @staticmethod
+    def _load_assi_codes(path, code_value: str) -> set:
+        """从中重度分型诊断.xlsx 的 GX_ASSI 表，按 DIP_ASSISTANT_TYPE=QTZD 且
+        DIP_ASSISTANT_CODE=code_value 收集诊断码前缀（code_value: '2' 重度 / '1' 中度）。
+
+        字典 ASSI_ITEM_ID 为带明细的 ICD 码（如 A01.000x005+），取前 3 位作为匹配键。
+        """
+        df = pd.read_excel(path, sheet_name="GX_ASSI")
+        sub = df[(df["DIP_ASSISTANT_TYPE"] == "QTZD") &
+                 (df["DIP_ASSISTANT_CODE"].astype(str) == code_value)]
+        codes = set()
+        for v in sub["ASSI_ITEM_ID"].dropna().astype(str):
+            v = v.strip().upper().replace(".", "")
+            if v:
+                codes.add(v[:3])
+        return codes
+
+    @staticmethod
+    def _split_diag_codes(code_str) -> list:
+        """把含多值分隔符（'|' / ';' / '、' / ',' / '+' / 空格）的次要诊断串拆成清大写的编码列表。
+
+        与 CCICalculator._split_codes 同口径，确保一条记录含多个次要诊断时逐码判断，
+        避免只取首码导致漏判（原实现直接取 related_diag_code[:3] 的缺陷）。
+        """
+        if not code_str:
+            return []
+        return [c.strip().upper() for c in str(code_str).replace("|", ";").replace("；", ";")
+                .replace("、", ";").replace(",", ";").replace("+", ";").split(";")
+                if c.strip()]
+
     def _has_severe_complication(self, diag_code: str) -> bool:
-        """检查是否含严重并发症（功能衰竭、休克、脓毒症）"""
-        if not diag_code:
-            return False
-        prefix = diag_code[:3]
-        # 休克、功能衰竭、脓毒症
-        severe_codes = [
-            ("R57", "R57.9"),  # 休克
-            ("N17", "N19"),    # 肾衰竭
-            ("J96", "J96.9"),  # 呼吸衰竭
-            ("K72", "K72.9"),  # 肝衰竭
-            ("A40", "A41.9"),  # 脓毒症
-        ]
-        for start, end in severe_codes:
-            if start <= prefix <= end:
-                return True
-        return False
-    
+        """次要诊断（可含多码）是否任意一条属于重度范围（功能衰竭/休克/脓毒症等，code=2）。"""
+        return any(str(c).upper()[:3] in self._severe_codes
+                   for c in self._split_diag_codes(diag_code))
+
     def _has_organ_damage(self, diag_code: str) -> bool:
-        """检查是否含重要器官病损、重要脏器感染"""
-        if not diag_code:
-            return False
-        prefix = diag_code[:3]
-        organ_codes = [
-            ("I20", "I25"),  # 缺血性心脏病
-            ("I60", "I69"),  # 脑血管病
-            ("J85", "J86"),  # 肺脓肿
-            ("K80", "K87"),  # 胆囊炎
-            ("N10", "N17"),  # 肾感染
-        ]
-        for start, end in organ_codes:
-            if start <= prefix <= end:
+        """次要诊断（可含多码）是否任意一条属于中度范围（重要器官病损/感染，code=1）。"""
+        return any(str(c).upper()[:3] in self._organ_damage_codes
+                   for c in self._split_diag_codes(diag_code))
+
+    def _has_metastasis(self, diag_code: str, main_diag_code: str) -> bool:
+        """次要诊断（可含多码）是否含肿瘤转移/其他部位并发：
+
+        - 命中中重度字典转移分型码集(code=3, C77/C78/C79 继发性/远处转移部位)，或
+        - 属于恶性肿瘤(C00-C96)且所属类目(前3位)与主要诊断不同（其他部位原发恶性肿瘤）；
+        且均与主要诊断类目不同。供恶性肿瘤严重程度『肿瘤转移并发』判定参考。
+        """
+        main_prefix = (main_diag_code or "")[:3].upper()
+        for c in self._split_diag_codes(diag_code):
+            cp = c[:3].upper()
+            if cp == main_prefix:
+                continue
+            if cp in self._metastasis_codes:
+                return True
+            if "C00" <= cp <= "C96":
                 return True
         return False
 
@@ -690,7 +794,9 @@ class AuxiliaryDirectoryCalculator:
         all_records: List[MedicalRecord] = None,
         disease_avg_cost: Decimal = Decimal("0"),
         disease_avg_los: Decimal = Decimal("0"),
-        disease_mortality_rate: Decimal = Decimal("0")
+        disease_mortality_rate: Decimal = Decimal("0"),
+        rw: Decimal = None,
+        point_value: Decimal = None
     ) -> Dict:
         """
         计算所有辅助分型调节系数
@@ -715,10 +821,9 @@ class AuxiliaryDirectoryCalculator:
             "max_type": "无"
         }
         
-        # 1. CCI计算
-        diagnoses = [record.main_diag_code]
-        if record.related_diag_code:
-            diagnoses.append(record.related_diag_code)
+        # 1. CCI计算（B1 修正：仅使用其他诊断/相关诊断，不计入主诊断）
+        # 多值其他诊断（'|' 分隔等）逐码拆分，确保合并症 CCI 算全
+        diagnoses = self.cci_calculator._split_codes(record.related_diag_code)
         cci_score = self.cci_calculator.calculate_cci(diagnoses)
         cci_level, cci_coeff = self.cci_calculator.get_cci_level(cci_score)
         results["cci"] = {
@@ -728,10 +833,18 @@ class AuxiliaryDirectoryCalculator:
         }
         
         # 2. 疾病严重程度分型
+        # 分值费用标准（高费用判定基准）= 未测算辅助分型的核心病种的平均费用（mi）。
+        # 本地目录测算不计算真实点值，故默认直接取 disease_avg_cost（即该核心病种
+        # 成组后的平均费用）。若调用方显式传入真实预算点值(rw, point_value)，可改用
+        # 支付标准 = RW × 点值 作为基准（覆盖默认 mi）——仅当接入真实点值时使用。
+        if rw is not None and point_value is not None and point_value > 0:
+            cost_standard = rw * point_value
+        else:
+            cost_standard = disease_avg_cost
         is_tumor = self._is_tumor_diagnosis(record.main_diag_code)
         if is_tumor:
             results["severity"] = self.severity_classifier.classify_malignant_tumor(
-                record, disease_avg_cost, disease_avg_cost * Decimal("2")
+                record, disease_avg_cost, cost_standard
             )
         else:
             results["severity"] = self.severity_classifier.classify_non_malignant(record)
@@ -838,5 +951,274 @@ class AuxiliaryDirectoryCalculator:
                 "max_coefficient": aux_result["max_coefficient"],
                 "max_type": aux_result["max_type"]
             })
-        
+
         return results
+
+    # ------------------------------------------------------------------
+    # 统一辅助分型引擎（子组级聚类 + 差异前置闸门）
+    #
+    # 设计严格贴合 DIP3.0 规范 §5.2 与用户口径：
+    #   1. 辅助分型发生在「核心病种聚类成组之后」，针对组内费用偏高的病例，
+    #      结合 CCI / 疾病严重程度 / 年龄 / 监护病房 等多维度「再次聚类」成子型组，
+    #      而非逐病例一条。
+    #   2. 触发条件（§5.2 三条，全部量化）：
+    #      (1) 病种病例数 > AUX_MIN_CORE_CASES（上年度病例数超一定例数）；
+    #      (2) 某分型评估病例数 > AUX_MIN_SUBTYPE_CASES（参与分型评估病例数超一定例数）；
+    #      (3) 组内费用变异系数偏大（cv_before >= AUX_CV_BEFORE_THRESHOLD，规范术语建议
+    #          遴选 CV>0.7 的病种引入辅助分型），且经某维度分型后组内费用 CV 下降明显
+    #          （reduction = (cv_before - cv_after)/cv_before >= AUX_CV_IMPROVEMENT_THRESHOLD，
+    #          规范示例 20% 以上）→ 二者同时成立才算该维度「达标」。
+    #      监护病房住院天数辅助分型的触发条件可适当放宽（AUX_ICU_RELAX_FACTOR）。
+    #   3. 维度竞争（§(二)）：若干个维度均达标时，选「触发系数最高」的维度胜出——
+    #      触发系数 = 该辅助分型平均住院费用 ÷ 病种平均住院费用 = mj / M（取该维度子型最大值）。
+    #   4. 子型系数（§(三)）：辅助分型调节系数 = mj / M（mj=子型均费，M=病种均费）；
+    #      CCI 分级按规范查表固定系数（不纳入 mj/M 重算）。
+    # ------------------------------------------------------------------
+    AUX_MIN_CORE_CASES = 10       # 触发条件(1)：病种上年度病例数超一定例数
+    AUX_MIN_SUBTYPE_CASES = 5     # 触发条件(2)：参与某一分型评估的病例数超一定例数
+    AUX_CV_BEFORE_THRESHOLD = 0.7  # 触发条件(3)-组内CV偏大门槛（规范术语：遴选CV>0.7引入辅助分型）
+    AUX_CV_IMPROVEMENT_THRESHOLD = 0.2  # 触发条件(3)-分型后CV下降≥20%（规范示例）
+    AUX_ICU_RELAX_FACTOR = 0.5    # 监护病房触发条件适当放宽因子（§5.2）
+    _CCI_LEVEL_COEFF = {
+        "无": Decimal("1.0"),
+        "一般": Decimal("1.1"),
+        "严重": Decimal("1.2"),
+        "极严重": Decimal("1.3"),
+    }
+
+    def build_auxiliary_subgroups(
+        self,
+        records: List[MedicalRecord],
+        core_disease_codes: Optional[set] = None,
+        min_core_cases: int = None,
+        min_subtype_cases: int = None,
+        cv_before_threshold: float = None,
+        cv_improvement_threshold: float = None,
+        icu_relax_factor: float = None,
+    ) -> List[AuxiliarySubgroup]:
+        """对核心病种记录做子组级辅助分型聚类（严格贴合 DIP3.0 §5.2）。
+
+        Args:
+            records: 全部（或已筛选的）病例记录。
+            core_disease_codes: 若提供，仅对该集合内的核心病种记录测算
+                                （Web 传核心病种码，避免综合病种混入）。
+            min_core_cases: 触发条件(1) 病种最小病例数（默认 AUX_MIN_CORE_CASES）。
+            min_subtype_cases: 触发条件(2) 子型最小病例数（默认 AUX_MIN_SUBTYPE_CASES）。
+            cv_before_threshold: 触发条件(3) 组内费用 CV 偏大门槛
+                                 （默认 AUX_CV_BEFORE_THRESHOLD=0.7）。
+            cv_improvement_threshold: 触发条件(3) 分型后 CV 下降幅度门槛
+                                 （默认 AUX_CV_IMPROVEMENT_THRESHOLD=0.2）。
+            icu_relax_factor: 监护病房维度门槛放宽因子（默认 AUX_ICU_RELAX_FACTOR=0.5）。
+
+        Returns:
+            AuxiliarySubgroup 列表（子组级；无任何维度达标的病种不产生子组）。
+        """
+        if min_core_cases is None:
+            min_core_cases = self.AUX_MIN_CORE_CASES
+        if min_subtype_cases is None:
+            min_subtype_cases = self.AUX_MIN_SUBTYPE_CASES
+        if cv_before_threshold is None:
+            cv_before_threshold = self.AUX_CV_BEFORE_THRESHOLD
+        if cv_improvement_threshold is None:
+            cv_improvement_threshold = self.AUX_CV_IMPROVEMENT_THRESHOLD
+        if icu_relax_factor is None:
+            icu_relax_factor = self.AUX_ICU_RELAX_FACTOR
+
+        if core_disease_codes is not None:
+            recs = [r for r in records if r.dip_disease_code in core_disease_codes]
+        else:
+            recs = list(records)
+
+        groups = defaultdict(list)
+        for r in recs:
+            groups[r.dip_disease_code].append(r)
+
+        subgroups: List[AuxiliarySubgroup] = []
+        for dcode, grecs in groups.items():
+            subs = self._build_disease_aux_subgroups(
+                dcode, grecs, min_core_cases, min_subtype_cases,
+                cv_before_threshold, cv_improvement_threshold, icu_relax_factor,
+            )
+            subgroups.extend(subs)
+        return subgroups
+
+    def _build_disease_aux_subgroups(
+        self, dcode, grecs, min_core, min_subtype,
+        cv_before_threshold, cv_improvement_threshold, icu_relax_factor,
+    ) -> List[AuxiliarySubgroup]:
+        n = len(grecs)
+        if n < min_core:
+            return []
+        costs = [float(r.total_cost) for r in grecs]
+        M = sum(costs) / n if n else 0.0
+        if M <= 0:
+            return []
+
+        dname = getattr(grecs[0], "dip_disease_name", None) or dcode
+        disease_mean = Decimal(str(M))
+
+        # 触发条件(3)-前：分型前（整个核心病种组）组内费用变异系数 CV（偏大才值得分型）
+        cv_before = self._compute_cv(costs)
+
+        dim_defs = {
+            "CCI": self._label_cci,
+            "疾病严重程度": lambda r: self._label_severity(r, disease_mean),
+            "年龄特征": self._label_age,
+            "重症监护": self._label_icu,
+        }
+
+        candidates = []  # 每个维度一个候选：{dimension, kept, cv_after, reduction, trigger}
+        for dim_name, labeller in dim_defs.items():
+            subtype_costs = defaultdict(list)
+            for r in grecs:
+                st = labeller(r)
+                subtype_costs[st].append(float(r.total_cost))
+
+            if dim_name == "CCI":
+                # CCI 系数查表、临床意义固定，不做低频合并
+                kept = dict(subtype_costs)
+            else:
+                kept = {st: c for st, c in subtype_costs.items() if len(c) >= min_subtype}
+                merged = [c for st, c in subtype_costs.items() if len(c) < min_subtype]
+                if merged:
+                    kept["其他(低频合并)"] = [x for sub in merged for x in sub]
+
+            if len(kept) < 2:
+                continue  # 仅一个子型 → 无差异，跳过该维度
+
+            # 触发条件(3)-后：沿该维度拆分后的组内费用变异系数（池化，资源消耗差异度）
+            cv_after = self._compute_cv_after_split(kept, M, n)
+            reduction = (cv_before - cv_after) / cv_before if cv_before > 0 else 0.0
+            # 触发系数 = 该维度的子型最大 mj/M（mj=子型均费，M=病种均费；§(二)）
+            trigger = max((sum(c) / len(c)) / M for c in kept.values()) if M else 1.0
+            candidates.append({
+                "dimension": dim_name,
+                "kept": kept,
+                "cv_before": cv_before,
+                "cv_after": cv_after,
+                "reduction": reduction,
+                "trigger": trigger,
+            })
+
+        # 闸门 + 维度竞争（§5.2 (一)(二)）：组内CV偏大 且 分型后CV下降≥20% 才算达标；
+        # 多个达标维度取「触发系数(mj/M)最高」者胜出（实际应用的维度）。
+        winner = self._select_winning_dimension(
+            candidates, cv_before_threshold, cv_improvement_threshold, icu_relax_factor
+        )
+        if winner is None:
+            # 无任何维度达标（组内同质或分型未明显改善差异）→ 不测算辅助分型
+            return []
+
+        out: List[AuxiliarySubgroup] = []
+        for cand in candidates:
+            dim_name = cand["dimension"]
+            is_winner = (dim_name == winner)
+            for st, c in cand["kept"].items():
+                mj = sum(c) / len(c)
+                if dim_name == "CCI":
+                    coeff = self._CCI_LEVEL_COEFF.get(st, Decimal("1.0"))
+                else:
+                    coeff = Decimal(str(mj / M)) if M else Decimal("1.0")
+                out.append(AuxiliarySubgroup(
+                    disease_code=dcode,
+                    disease_name=dname,
+                    dimension=dim_name,
+                    subtype=st,
+                    case_count=len(c),
+                    avg_cost=Decimal(str(mj)),
+                    coefficient=coeff,
+                    cv_before=cand["cv_before"],
+                    cv_after=cand["cv_after"],
+                    cv_reduction=cand["reduction"],
+                    trigger_coefficient=Decimal(str(cand["trigger"])),
+                    is_winning_dimension=is_winner,
+                    is_other=(st == "其他(低频合并)"),
+                ))
+        return out
+
+    @staticmethod
+    def _compute_cv(values) -> float:
+        """变异系数 CV = 标准差 / 均值（费用波动程度）。空/均值为 0 时返回 0。"""
+        n = len(values)
+        if n == 0:
+            return 0.0
+        mean = sum(values) / n
+        if mean == 0:
+            return 0.0
+        var = sum((v - mean) ** 2 for v in values) / n
+        return (var ** 0.5) / mean
+
+    @staticmethod
+    def _compute_cv_after_split(kept: Dict[str, list], M: float, n: int) -> float:
+        """沿某维度拆分后，组内（池化）费用变异系数 CV（资源消耗差异度）。
+
+        池化组内方差 = Σ_k Σ_{x∈k} (x - m_k)² / N，再 σ_within / M。
+        反映分型后各子型内部的费用离散程度（越小说明分型把钱花得接近的病例聚到一起）。
+        """
+        if M <= 0 or n == 0:
+            return 0.0
+        ss_within = 0.0
+        for c in kept.values():
+            if not c:
+                continue
+            mk = sum(c) / len(c)
+            ss_within += sum((x - mk) ** 2 for x in c)
+        var_within = ss_within / n
+        return (var_within ** 0.5) / M
+
+    @staticmethod
+    def _select_winning_dimension(
+        candidates: list,
+        cv_before_threshold: float,
+        cv_improvement_threshold: float,
+        icu_relax_factor: float,
+    ) -> Optional[str]:
+        """§5.2 闸门 + 维度竞争。
+
+        闸门：组内费用 CV 偏大（cv_before >= 门槛，ICU 放宽）且分型后 CV 下降
+              幅度 >= 门槛（ICU 放宽）→ 该维度达标。
+        竞争：多个达标维度中，取「触发系数(mj/M)最高」者胜出（§(二)）。
+        无任何维度达标返回 None（该病种不测算辅助分型）。
+        """
+        passing = []
+        for c in candidates:
+            dim = c["dimension"]
+            relax = icu_relax_factor if dim == "重症监护" else 1.0
+            bt = cv_before_threshold * relax
+            it = cv_improvement_threshold * relax
+            if c["cv_before"] >= bt and c["reduction"] >= it:
+                passing.append(c)
+        if not passing:
+            return None
+        return max(passing, key=lambda c: c["trigger"])["dimension"]
+
+    # ---- 各维度子型标签 ----
+    def _label_cci(self, rec: MedicalRecord) -> str:
+        diags = self.cci_calculator._split_codes(rec.related_diag_code)
+        score = self.cci_calculator.calculate_cci(diags)
+        level, _ = self.cci_calculator.get_cci_level(score)
+        return level
+
+    def _label_severity(self, rec: MedicalRecord, disease_mean: Decimal) -> str:
+        if self._is_tumor_diagnosis(rec.main_diag_code):
+            res = self.severity_classifier.classify_malignant_tumor(
+                rec, disease_mean, disease_mean
+            )
+        else:
+            res = self.severity_classifier.classify_non_malignant(rec)
+        return res["level"]
+
+    def _label_age(self, rec: MedicalRecord) -> str:
+        res = self.age_classifier.classify(rec)
+        if res is None:
+            return "基准(无)"
+        sub = res.get("sub_level")
+        return f"{res['level']}({sub})" if sub else res["level"]
+
+    def _label_icu(self, rec: MedicalRecord) -> str:
+        icu_days = getattr(rec, "icu_days", 0)
+        res = self.icu_classifier.classify(icu_days)
+        if res is None:
+            return "基准(无)"
+        sub = res.get("sub_level")
+        return f"{res['level']}({sub})" if sub else res["level"]

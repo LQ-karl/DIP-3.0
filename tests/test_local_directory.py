@@ -6,9 +6,11 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
+import pytest
 from pathlib import Path
 
 from src import DIPGroupingTool, LocalDirectoryGenerator
+from src.models.models import GroupType
 from src.utils.paths import get_output_dir
 
 
@@ -233,7 +235,7 @@ def test_comprehensive_disease_subtypes():
     rows = []
     specs = [
         # (诊断码, 诊断名, 手术码, 手术名, 期望子组, 期望类别)
-        ("A01.0", "测试内科病",   "",        "",            "内科诊疗组",   ""),
+        ("A01.0", "测试内科病",   "",        "",            "保守治疗组",   ""),
         ("B01.0", "测试诊断操作", "00.2100", "诊断性操作A", "诊断性操作组", "诊断性操作"),
         ("C01.0", "测试治疗操作", "00.0100", "治疗性操作A", "治疗性操作组", "治疗性操作"),
         ("D01.0", "测试手术",     "00.7000", "手术A",       "相关手术组",   "手术"),
@@ -258,12 +260,12 @@ def test_comprehensive_disease_subtypes():
     assert len(mixed) >= 4, f"综合病种数量应 >=4，实际 {len(mixed)}"
 
     subtypes = {g.mixed_subtype for g in mixed}
-    for expected in ("内科诊疗组", "诊断性操作组", "治疗性操作组", "相关手术组"):
+    for expected in ("保守治疗组", "诊断性操作组", "治疗性操作组", "相关手术组"):
         assert expected in subtypes, f"缺少综合病种子组: {expected}"
 
     # 子组 <-> 类别 一致性校验
     by_sub = {g.mixed_subtype: g for g in mixed}
-    assert by_sub["内科诊疗组"].op_category == "", "内科诊疗组 op_category 应为空"
+    assert by_sub["保守治疗组"].op_category == "", "保守治疗组 op_category 应为空"
     assert by_sub["诊断性操作组"].op_category == "诊断性操作"
     assert by_sub["治疗性操作组"].op_category == "治疗性操作"
     # 手术 / 介入治疗 均并入相关手术组，类别分别为 手术 / 介入治疗
@@ -275,80 +277,110 @@ def test_comprehensive_disease_subtypes():
     assert all(not g.excluded for g in mixed), "默认 exclude_below_threshold=False 不应剔除综合病种"
 
 
-def test_core_disease_priority_and_merge():
-    """核心病种前三层（先期分组 / 并项规则）成组键校验。
+def test_resolve_category_name_prefers_icd10_map():
+    """综合病种类目名称优先使用 ICD-10 医保2.0 版权威类目名称。
 
-    构造样例验证：
-      ① 先期分组：低出生体重(不足1周岁+出生体重<2500g，不看诊断) /
-         器官移植(55.6901肾移植) / 呼吸循环支持(96.7101呼吸机)
-         各自形成 PRI| 前缀的独立组，且不误伤组织移植(角膜11.6000)/
-         冠脉旁路(36.1200)；对照：足月正常体重新生儿不进先期；
-      ② 并项规则：D18.0 多术式整体并项、I20.0/I20.1 诊断并项(3位码)、
-         I70.1 肾动脉支架+球囊联合手术并项，均合并为单一组；
-      ③ 普通病种仍走基本规则键。
+    _resolve_category_name 应为实例方法：注入 _icd10_category_map 后，即使
+    candidates 给了不同名称，也应返回权威类目名称；仅在映射缺失时回退到病例名推导。
+    """
+    from src.core.local_directory_generator import LocalDirectoryGenerator
+
+    gen = LocalDirectoryGenerator(threshold=10)
+    # 注入权威映射（优先级 1）
+    gen._icd10_category_map = {"J18": "肺炎", "I20": "心绞痛"}
+    # 即使病例名是「急性肺炎」「不稳定性心绞痛」，也应取权威类目名称
+    assert gen._resolve_category_name("J18", [("J18.9", "急性肺炎")]) == "肺炎"
+    assert gen._resolve_category_name("I20", [("I20.0", "不稳定性心绞痛")]) == "心绞痛"
+
+    # 映射缺失时回退：精确 3 位码候选 -> 取其名；否则取最短名称
+    gen._icd10_category_map = {}
+    assert gen._resolve_category_name("K35", [("K35.9", "急性阑尾炎")]) == "急性阑尾炎"
+    assert gen._resolve_category_name("K35", [("K35.1", "急性阑尾炎伴腹膜脓肿"),
+                                               ("K35.9", "急性阑尾炎")]) == "急性阑尾炎"
+    # 无候选时兜底返回 3 位码
+    assert gen._resolve_category_name("Z98", []) == "Z98"
+
+
+def test_core_disease_priority_and_merge():
+    """核心病种前三层（先期分组 / 并项规则）成组键校验（DIP3.0 新目录引擎版）。
+
+    构造样例验证（引擎自动加载 data/DIP3.0国家目录库.xlsx，成组键=方案序号）：
+      ① 先期分组：低出生体重(不足1周岁+出生体重<2500g，不看诊断)→XQ-17 /
+         器官移植(55.6901肾移植)→XQ-6 / 呼吸循环支持(96.7201有创呼吸机≥96h)→XQ-14，
+         均直出先期方案序号；对照：角膜移植(11.6000)按不纳入手术规则
+         「按保守治疗入组」→JC-2975(H16.0-保守治疗-)，不进先期；
+         冠脉旁路(36.1200)国家目录无对应行→回落内置种子规则键；对照：足月
+         正常体重新生儿不进先期→JC-4513(P59.9-保守治疗-)；
+      ② 并项规则（按 BX 名录查表）：D18.0 两条规范并项术式(21.0300x003/21.0300x004)
+         并为同组 BX-332；I20.0/I20.1+36.0700 诊断3位并项为同组 BX-609；
+         I70.1 肾动脉支架(主)+球囊(相关) 并项为 BX-720；
+      ③④ 普通病种仍走基本规则（K35.9+47.0100→JC-3625）。
     """
     rows = []
-    def add(dx, op="", n=3, cost=10000, **extra):
+    def add(dx, op="", relop="", n=3, cost=10000, **extra):
         for i in range(n):
             row = {
                 "主要诊断代码": dx, "主要诊断名称": dx,
                 "主要手术操作代码": op, "主要手术操作名称": op or "",
+                "相关手术操作代码": relop, "相关手术操作名称": relop or "",
                 "医疗总费用": cost + i * 10,
             }
             row.update(extra)
             rows.append(row)
-    # ① 低出生体重：天龄10天 + 出生体重1400g（极低体重）→ PRI|LBW
+    # ① 低出生体重：天龄10天 + 出生体重1400g（极低体重）→ XQ-17
     add("P07.0", "", **{"天龄": 10, "出生体重": 1400})
-    # 对照: 新生儿但体重正常(3200g) → 不进先期
+    # 对照: 新生儿但体重正常(3200g) → 不进先期 → JC-4513(P59.9-保守治疗-)
     add("P59.9", "", **{"天龄": 5, "出生体重": 3200})
-    add("N18.5", "55.6901")                 # ① 器官移植(肾)
-    add("A41.9", "96.7101")                 # ① 呼吸循环支持(呼吸机)
-    add("H16.0", "11.6000", n=3)            # 对照: 角膜移植(组织移植, 非先期)
-    add("I25.1", "36.1200", n=3)            # 对照: 冠脉旁路(非先期, 非并项族)
-    # ② 并项
-    add("D18.0", "21.0300x003", n=3)        # D18.0 血管瘤术式1
-    add("D18.0", "21.3104", n=3)            # D18.0 血管瘤术式2 -> 应与上并项
-    add("I20.0", "36.0600", n=3)            # I20.0 心绞痛
-    add("I20.1", "36.0600", n=3)            # I20.1 心绞痛 -> 应与 I20.0 并项
-    add("I70.1", "39.9016", n=3)            # 肾动脉支架
-    add("I70.1", "39.5002", n=3)            # 肾动脉球囊 -> 应与支架并项
-    add("K35.9", "47.0100", n=3)            # 对照: 基本规则
+    add("N18.5", "55.6901")                 # ① 器官移植(肾) → XQ-6
+    add("A41.9", "96.7201")                 # ① 呼吸循环支持(有创呼吸机≥96h) → XQ-14
+    add("H16.0", "11.6000", n=3)            # 对照: 角膜移植 → 不纳入手术(按保守治疗入组)→JC-2975
+    add("I25.1", "36.1200", n=3)            # 对照: 冠脉旁路(国家目录无行→种子回落)
+    # ② 并项（BX 名录查表）
+    add("D18.0", "21.0300x003", n=3)        # D18.0 规范并项术式1
+    add("D18.0", "21.0300x004", n=3)        # D18.0 规范并项术式2 → 与术式1同组 BX-332
+    add("I20.0", "36.0700", n=3)            # I20.0 支架 → BX-609(诊断3位并项 I20)
+    add("I20.1", "36.0700", n=3)            # I20.1 支架 → 与 I20.0 同组 BX-609
+    add("I70.1", "39.9016", relop="39.5002", n=3)   # 支架(主)+球囊(相关) → BX-720 并项
+    add("I70.1", "39.5002", n=3)            # 对照: 仅球囊 → JC-3285 基本规则
+    add("K35.9", "47.0100", n=3)            # 对照: 基本规则 JC-3625
     df = pd.DataFrame(rows)
 
     gen = LocalDirectoryGenerator(threshold=2)
     groups = gen.cluster_records_to_groups(df)
     keys = list(groups.keys())
 
-    # ① 先期：三类各一组
-    pri = [k for k in keys if k.startswith("PRI|")]
-    assert len(pri) == 3, f"先期组应恰好 3 个(PRI|)，实际 {pri}"
-    lbw = [k for k in pri if k.startswith("PRI|LBW|")]
-    assert len(lbw) == 1, f"低出生体重应 1 组, 实际 {lbw}"
-    assert "新生儿期" in lbw[0] and "极低" in lbw[0], \
-        f"天龄10+1400g 应为 新生儿期|极低出生体重档, 实际 {lbw[0]}"
-    assert any(k.startswith("PRI|TRANSPLANT|") for k in pri)
-    assert any(k.startswith("PRI|LIFESUPPORT|") for k in pri)
-    # 角膜移植 / 冠脉旁路 不应进入先期
-    assert not any(k.startswith("H16|") and "PRI" in k for k in keys)
-    assert not any(k.startswith("I25|36.1200") and "PRI" in k for k in keys)
-    # 正常体重新生儿(P59.9, 3200g) 不应进先期，应走基本规则
-    assert any(k.startswith("P59|") for k in keys), "正常体重新生儿应走基本规则键"
+    # ① 先期：三类各一组（方案序号键，国家目录直出）
+    for seq, name in (("XQ-17", "低出生体重(1000-1499g)"),
+                      ("XQ-6", "器官移植"), ("XQ-14", "呼吸循环支持")):
+        assert seq in keys, f"先期组 {name} 应直出 {seq}，实际 {sorted(keys)}"
+        assert groups[seq].grouping_layer == "先期分组"
+        assert groups[seq].national_matched is True
+    assert "出生体重1000-1499克" in groups["XQ-17"].national_dip_code, \
+        f"1400g 应命中极低出生体重档，实际 {groups['XQ-17'].national_dip_code}"
+    # 角膜移植不进先期，且按不纳入手术规则「按保守治疗入组」→ H16.0-保守治疗-
+    assert "JC-2975" in keys and groups["JC-2975"].grouping_layer == "基本规则", \
+        f"角膜移植(11.6000)应按保守治疗入组 JC-2975，实际 {sorted(k for k in keys if 'H16' in k)}"
+    # 冠脉旁路 国家目录无对应行 → 回落内置种子规则键
+    assert "I25|36.1200|" in keys, "冠脉旁路应回落种子规则键"
+    # 正常体重新生儿(P59.9, 3200g) 不进先期 → JC-4513(P59.9-保守治疗-)
+    assert "JC-4513" in keys, "正常体重新生儿应走基本规则保守治疗组"
 
-    # ② 并项：D18.0 两术式 -> 1 组
-    d18 = [k for k in keys if k.startswith("D18|")]
-    assert len(d18) == 1 and d18[0] == "D18|OPMERGE", f"D18.0 应并项为 1 组, 实际 {d18}"
+    # ② 并项：D18.0 两规范术式 → 同组 BX-332（6例）
+    assert groups["BX-332"].case_count == 6, \
+        f"D18.0 两术式应并项同组 BX-332(6例)，实际 {groups['BX-332'].case_count}"
+    assert groups["BX-332"].grouping_layer == "并项规则"
 
-    # I20.0 / I20.1 -> 1 组(3位码 I20)
-    i20 = [k for k in keys if k.startswith("I20|")]
-    assert len(i20) == 1 and i20[0] == "I20|36.0600|", f"心绞痛应 3 位码并项 1 组, 实际 {i20}"
+    # I20.0 / I20.1 + 36.0700 → 同组 BX-609（诊断3位 I20 并项，6例）
+    assert groups["BX-609"].case_count == 6, \
+        f"I20.0/I20.1 应诊断并项同组 BX-609(6例)，实际 {groups['BX-609'].case_count}"
 
-    # I70.1 肾动脉支架/球囊 -> 1 组(REN_STENT_BALLOON)
-    i70 = [k for k in keys if "REN_STENT_BALLOON" in k]
-    assert len(i70) == 1, f"肾动脉联合手术应并项 1 组, 实际 {i70}"
+    # I70.1 支架(主)+球囊(相关) → BX-720 并项；仅球囊 → JC-3285 基本规则
+    assert "BX-720" in keys and groups["BX-720"].grouping_layer == "并项规则"
+    assert "JC-3285" in keys and groups["JC-3285"].grouping_layer == "基本规则"
 
     # ①+② 不应影响普通基本规则病种
-    assert "K35|47.0100|" in keys, "普通病种应保留基本规则键"
-    assert "H16|11.6000|" in keys, "角膜移植应走基本规则(非先期)"
+    assert "JC-3625" in keys, "普通病种 K35.9+47.0100 应落 JC-3625(K35-47.0100-)"
+    assert groups["JC-3625"].grouping_layer == "基本规则"
 
 
 def test_auxiliary_typing():
@@ -395,11 +427,11 @@ def test_auxiliary_typing():
     assert sev.classify_non_malignant(rec(discharge_status="死亡", los=2))["level"] == "死亡-IV-A"
     assert sev.classify_non_malignant(rec(discharge_status="死亡", los=5))["level"] == "死亡-IV-B"
     # 重度：功能衰竭/休克/脓毒症 + 住院≥3天
-    assert sev.classify_non_malignant(rec(related_diag_code="J96.0", los=6))["level"] == "重度"
+    assert sev.classify_non_malignant(rec(related_diag_code="R57.0", los=6))["level"] == "重度"
     # 中度：重要器官病损/感染 + 住院≥3天
     assert sev.classify_non_malignant(rec(related_diag_code="I63.9", los=6))["level"] == "中度"
     # 住院<3天不升级
-    assert sev.classify_non_malignant(rec(related_diag_code="J96.0", los=2))["level"] == "轻度"
+    assert sev.classify_non_malignant(rec(related_diag_code="R57.0", los=2))["level"] == "轻度"
     assert sev.classify_non_malignant(rec())["level"] == "轻度"
     # 恶性肿瘤：死亡 IV-A；高费用类型一（费用≥3倍标准且治疗费占比≥50%）
     std = Decimal("10000")
@@ -449,18 +481,19 @@ def test_auxiliary_typing():
 
     # X 触发组：30 例（轻度 20 + 重度 10），费用双峰 → CV 改善显著
     add("K35.9", "急性阑尾炎", 8000, 20)
-    add("K35.9", "急性阑尾炎", 40000, 10, related="J96.0", los=10)
+    add("K35.9", "急性阑尾炎", 40000, 10, related="R57.0", los=10)
     # Y 对照组：20 例费用均匀 → 无 CV 改善，不触发
     add("I10", "原发性高血压", 5000, 20)
     # Z 门控组：12 例双峰，但 < min_total_cases(15) → 不触发
     add("E11.9", "2型糖尿病", 6000, 6)
-    add("E11.9", "2型糖尿病", 30000, 6, related="J96.0", los=10)
+    add("E11.9", "2型糖尿病", 30000, 6, related="R57.0", los=10)
 
     df = pd.DataFrame(rows)
     gen = LocalDirectoryGenerator(threshold=10)
     groups = gen.cluster_records_to_groups(df)
     typed = gen.apply_auxiliary_typing(
-        groups, min_total_cases=15, min_type_cases=5, cv_improvement_pct=0.20
+        groups, min_total_cases=15, min_type_cases=5, cv_improvement_pct=0.20,
+        cv_mode="improvement",
     )
 
     # X：应按「严重程度」拆分为子组，父组行消失，病例数守恒
@@ -474,10 +507,10 @@ def test_auxiliary_typing():
     assert sum(g.case_count for g in x_subs) == 30, "拆分后病例数应守恒(30)"
     assert not any(g.main_diag_code == "K35.9" and not g.auxiliary_parent_code
                    for g in typed.values()), "拆分后父病种不应再单独成行"
-    # 触发评估报告应有记录
+    # 触发评估报告应有记录（新成组键下以 main_diag_code 定位病种）
     x_report = [r for r in gen.auxiliary_trigger_report
                 if r['dimension'] == '严重程度' and r['triggered'] == '是'
-                and 'K35' in r['disease_code']]
+                and r.get('main_diag_code') == 'K35.9']
     assert x_report, "触发评估报告应记录 K35.9 严重程度维度触发"
     assert x_report[0]['cv_improvement'] >= 0.20
 
@@ -492,23 +525,72 @@ def test_auxiliary_typing():
         "病例数不足 min_total_cases 的组不应被拆分"
 
 
-def test_diagnostic_auxiliary_subdivision():
-    """核心病种第三层·诊断辅助细分（③成组层）：与第三步辅助分型(触发式)严格区分。
+def test_auxiliary_typing_runs_after_four_layers():
+    """顺序护栏回归：辅助分型(第三步)必须排在四层成组之后。
 
-    验证 ③ 在聚类阶段即产出独立核心病种成组键（各自 RW），与第三步
-    「触发式辅助分型」(严重程度/年龄/ICU/CCI，不产成组键、仅加元数据) 机制不同：
-      (A) 肿瘤放化疗靶向免疫：主诊断 Z51.1/Z51.8 + 其他诊断(C00-C95)
-          + 主要/相关手术操作(化疗99.2503/靶向99.2800x006/免疫99.2800x005 组合)
-          → AUX|TUMOR|<肿瘤3位>|<治疗方式>
-      (B) 结核耐药：A15-A19 + (主诊断含耐药拓展码 或 其他诊断含 U84.300)
-          → AUX|TB|<A15-A16/A17/A18/A19>|<耐药/非耐药>
-      (C) 烧伤类：先区分年龄(<18岁/≥18岁)，再按 程度(主诊断 T29/T30 名称含 一度/二度/三度，
-          取自《ICD10国临版2.0对照医保版2.0_0125》，不使用编码第4位) + 面积(次要诊断 T31/T32
-          名称含百分比区间) 细分，严格对齐《函》5016–5039 → 返回条目号 DIP 编码
-          （一度烧伤《函》无对应组→回落基本规则）
-    非肿瘤非结核非烧伤病种不进入 ③，保留基本规则键（不与辅助分型混淆）。
-    肿瘤其他诊断范围收窄为 C00-C75/C76-C80/C81-C86/C88/C90/C91-C95，
-    C87/C89/C96/C97/D 类不再触发肿瘤细分。
+    - 四层成组(cluster_records_to_groups)后，所有核心病种须已带合法 grouping_layer；
+    - 辅助分型在四层成组之后可正常运行，且拆出的子组继承父层分组层次；
+    - 负例：若把某核心病种的 grouping_layer 抹空（模拟四层成组未完成就调辅助分型），
+      护栏须抛 RuntimeError 阻断，阻止顺序回归。
+    """
+    rows = []
+    def add(dx, name, cost, n, related="", los=5, age_=45):
+        for i in range(n):
+            rows.append({
+                "主要诊断代码": dx, "主要诊断名称": name,
+                "主要手术操作代码": "", "主要手术操作名称": "",
+                "相关诊断代码": related,
+                "医疗总费用": cost + i * 10, "药品费用": 1000, "治疗费用": 1000,
+                "住院天数": los, "年龄": age_, "ICU天数": 0, "出院状态": "医嘱离院",
+            })
+    add("K35.9", "急性阑尾炎", 8000, 20)
+    add("K35.9", "急性阑尾炎", 40000, 10, related="R57.0", los=10)
+    add("I10", "原发性高血压", 5000, 20)
+    df = pd.DataFrame(rows)
+    gen = LocalDirectoryGenerator(threshold=10)
+    groups = gen.cluster_records_to_groups(df)
+
+    # 1) 四层成组后，所有核心病种都带合法分组层次（先期/并项/诊断辅助细分/基本规则）
+    core = [g for g in groups.values()
+            if g.group_type == GroupType.CORE and not g.excluded]
+    assert core, "应有核心病种"
+    assert all(g.grouping_layer in LocalDirectoryGenerator.LAYER_ORDER for g in core), \
+        "四层成组后核心病种须带合法 grouping_layer"
+
+    # 2) 辅助分型在四层成组之后顺利运行；拆出的子组继承父层分组层次
+    typed = gen.apply_auxiliary_typing(groups, min_total_cases=15, min_type_cases=5,
+                                       cv_mode="improvement")
+    for g in typed.values():
+        if g.auxiliary_parent_code:
+            assert g.grouping_layer in LocalDirectoryGenerator.LAYER_ORDER
+
+    # 3) 负例：抹空某核心病种的分组层次后“提前”调用，护栏须拦截
+    bad = dict(groups)
+    target = next(g for g in bad.values()
+                  if g.group_type == GroupType.CORE and not g.excluded)
+    target.grouping_layer = ""
+    with pytest.raises(RuntimeError):
+        gen.apply_auxiliary_typing(bad)
+
+
+def test_diagnostic_auxiliary_subdivision():
+    """核心病种第三层·诊断辅助细分（③成组层，DIP3.0 新目录引擎版）：与第三步辅助分型严格区分。
+
+    引擎自动加载 data/DIP3.0国家目录库.xlsx 后，③ 由国家目录 FZ 行直出方案序号；
+    引擎未命中（国家目录无对应行）时回落内置种子规则描述性键（向后兼容）。
+    验证与第三步「触发式辅助分型」(严重程度/年龄/ICU/CCI，不产成组键) 机制不同：
+      (A) 肿瘤放化疗靶向免疫：主诊断 Z51.1/Z51.8 + 其他诊断 C 范围
+          × 手术组合（目录行以 + 表示 AND：99.2503 / 99.2503+99.2800x006 / 三联）
+          → FZ-1774/FZ-1784/FZ-1793/FZ-1806 等；特异性优先（组合组胜过单码组）；
+          无治疗操作 → 国家目录无对应行 → 降级描述键 AUX|TUMOR|C80|其他；
+      (B) 结核耐药：A15-A19 + (主诊断耐药拓展码 或 其他诊断 U84.300)
+          → FZ-1836(耐药)/FZ-1837(非耐药)/FZ-1840(A17耐药)/FZ-1829(胸廓成形)；
+      (C) 烧伤类：主诊断 T20-T25 二度/三度部位码 + 其他诊断 T31/T32 面积档
+          × 手术（保守/切痫86.22族/植皮86.6族）→ FZ-1745/1746/1747/1764；
+          T30(未特指)不在目录烧伤行主诊断内 → 引擎未命中回落种子规则(5025，向后兼容)；
+          一度(T30.100)《目录》无对应组 → 基本规则。
+    非肿瘤非结核非烧伤病种不进入 ③（K35.9→JC-3625 基本规则）。
+    肿瘤其他诊断范围收窄为 C00-C95 允许范围，C97/D 类不再触发肿瘤细分。
     """
     rows = []
 
@@ -524,27 +606,30 @@ def test_diagnostic_auxiliary_subdivision():
             row.update(extra)
             rows.append(row)
 
-    # (A) 肿瘤放化疗靶向免疫
-    add("Z51.1", relop="99.2503", reldx="C80")                              # 化疗
-    add("Z51.1", relop="99.2800x006", reldx="C81")                          # 靶向
-    add("Z51.8", relop="99.2800x005", reldx="C90")                          # 免疫
-    add("Z51.1", relop="99.2503+99.2800x006", reldx="C88")                  # 化疗+靶向
-    add("Z51.1", relop="99.2503+99.2800x006+99.2800x005", reldx="C91")       # 三联
-    add("Z51.1", reldx="C80")                                               # 无手术 → 其他
+    # (A) 肿瘤放化疗靶向免疫（目录组合行：99.2503 / +99.2800x006 / 三联）
+    add("Z51.1", op="99.2503", reldx="C80")                                 # 化疗 → FZ-1774
+    add("Z51.8", op="99.2800x005", reldx="C90")                             # 免疫 → FZ-1806
+    add("Z51.1", op="99.2503|99.2800x006", reldx="C88")                     # 化疗+靶向 → FZ-1784
+    add("Z51.1", op="99.2503+99.2800x006", reldx="C88")                     # 加号同义 → 同组 FZ-1784
+    add("Z51.1", op="99.2503+99.2800x006+99.2800x005", reldx="C91")          # 三联 → FZ-1793
+    add("Z51.1", reldx="C80")                                               # 无手术 → 降级描述键
     # (A-负例) 肿瘤范围收窄：C97 / D18 不再触发肿瘤细分 → 走基本规则
-    add("Z51.1", relop="99.2503", reldx="C97")
-    add("Z51.1", relop="99.2503", reldx="D18.0")
+    add("Z51.1", op="99.2503", reldx="C97")
+    add("Z51.1", op="99.2503", reldx="D18.0")
     # (B) 结核耐药
-    add("A15.1", reldx="")                                                  # 非耐药
-    add("A16", reldx="U84.300")                                             # 耐药(U84.300)
-    add("A17", reldx="U84.300;A15.0")                                       # 耐药(U84.300)
-    add("A15.000x010", reldx="")                                            # 耐药(主诊断拓展码)
-    # (C) 烧伤类（严格对齐《函》5016–5039，返回条目号 DIP 编码；程度/面积取自 ICD 名称）
-    add("T30.2", reldx="T31.1", **{"年龄": 35})    # 成人 二度 ≥18 10%-20% → 5025
-    add("T30.2", reldx="T31.1", **{"年龄": 5})     # 儿童 二度 <18 10%以上 → 5023
-    add("T30.700", reldx="T31.4", **{"年龄": 40})  # 成人 三度(腐蚀伤) ≥18 30%以上 → 5021
-    add("T30.700", reldx="", **{"年龄": 50})        # 成人 三度 ≥18 缺面积(最小档) → 5018
-    # (C-一度负例) T30.100 = 一度烧伤（《函》无对应组）→ 不进入诊断辅助细分 → 基本规则
+    add("A15.1")                                                            # 非耐药 → FZ-1837
+    add("A16", reldx="U84.300")                                             # 耐药(U84.300) → FZ-1836
+    add("A15.000x010")                                                      # 耐药(主诊断拓展码) → FZ-1836
+    add("A17", reldx="U84.300")                                             # → FZ-1840
+    add("A15.1", op="34.0401")                                              # 胸廓成形术 → FZ-1829
+    # (C) 烧伤类（目录烧伤行主诊断=T20-T25 二/三度部位码；无年龄维度）
+    add("T21.2", reldx="T31.0")                                             # 二度 <10% 保守 → FZ-1745
+    add("T21.2", op="86.2200x011", reldx="T31.0")                           # 二度 <10% 切痂 → FZ-1746
+    add("T21.2", op="86.6201", reldx="T31.0")                               # 二度 <10% 植皮 → FZ-1747
+    add("T21.3", reldx="T31.4")                                             # 三度 30-49% 保守 → FZ-1764
+    # (C-向后兼容) T30.2 未特指部位：目录烧伤行不含 T30 → 引擎未命中 → 种子规则 5025
+    add("T30.2", reldx="T31.1", **{"年龄": 35})
+    # (C-一度负例) T30.100 = 一度烧伤（目录无对应组）→ 不进入诊断辅助细分 → 基本规则
     add("T30.100", reldx="T31.1", **{"年龄": 40})
     # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分
     add("T31.1", reldx="", **{"年龄": 35})
@@ -556,60 +641,100 @@ def test_diagnostic_auxiliary_subdivision():
     groups = gen.cluster_records_to_groups(df)
     keys = list(groups.keys())
 
-    # (A) 肿瘤：5 种治疗方式 + 其他
-    assert "AUX|TUMOR|C80|化疗" in keys
-    assert "AUX|TUMOR|C81|靶向" in keys
-    assert "AUX|TUMOR|C90|免疫" in keys
-    assert "AUX|TUMOR|C88|化疗+靶向" in keys
-    assert "AUX|TUMOR|C91|化疗+靶向+免疫" in keys
-    assert "AUX|TUMOR|C80|其他" in keys
+    # (A) 肿瘤：国家目录 FZ 行直出方案序号
+    for seq in ("FZ-1774", "FZ-1806", "FZ-1793"):
+        assert seq in keys, f"肿瘤细分应直出 {seq}，实际 {sorted(keys)}"
+        assert groups[seq].grouping_layer == "诊断辅助细分"
+        assert groups[seq].national_matched is True
+    # 化疗+靶向：OR 与 + 两种写法同组（目录行 AND 组合，特异性优先）
+    assert groups["FZ-1784"].case_count == 2, \
+        f"99.2503|99.2800x006 与 99.2503+99.2800x006 应同入 FZ-1784(2例)，实际 {groups['FZ-1784'].case_count}"
+    # (A-降级) 无治疗操作 → 主手术为空记保守治疗 → JC-5111(Z51.1-保守治疗-)
+    assert "JC-5111" in keys and groups["JC-5111"].grouping_layer == "基本规则", \
+        "Z51.1 无治疗操作应按保守治疗入 JC-5111"
     # (A-负例) C97 / D18 已收窄出肿瘤范围 → 走基本规则(Z51 开头)
     assert not any(k.startswith("AUX|TUMOR|C97") for k in keys)
     assert not any(k.startswith("AUX|TUMOR|D18") for k in keys)
     assert any(k.startswith("Z51|") for k in keys), "收窄后 Z51.1+C97/D18 应走基本规则"
-    # (B) 结核（A15.000x010 主诊断耐药拓展码 与 A16+U84.300 同并入 A15-A16|耐药）
-    assert "AUX|TB|A15-A16|非耐药" in keys
-    assert "AUX|TB|A15-A16|耐药" in keys
-    assert "AUX|TB|A17|耐药" in keys
-    tb_resistant = groups["AUX|TB|A15-A16|耐药"]
-    assert tb_resistant.case_count == 2, \
-        f"U84.300 与主诊断拓展码两条路径应并入同组(2例)，实际 {tb_resistant.case_count}"
-    # (C) 烧伤：严格对齐《函》条目号（程度×年龄×面积）
-    assert "5025" in keys, "成人 二度 ≥18 10%-20% 应→5025"
-    assert "5023" in keys, "儿童 二度 <18 10%以上 应→5023"
-    assert "5021" in keys, "成人 三度 ≥18 30%以上 应→5021"
-    assert "5018" in keys, "成人 三度 缺面积(最小档) 应→5018"
-    for b in ("5025", "5023", "5021", "5018"):
-        assert getattr(groups[b], "national_matched", False) is True, f"{b} 应标记 national_matched"
-        assert getattr(groups[b], "grouping_layer", "") == "诊断辅助细分"
+    # (B) 结核：方案序号直出；两条耐药路径并入同组 FZ-1836(2例)
+    assert "FZ-1837" in keys, "A15.1 非耐药应落 FZ-1837"
+    assert "FZ-1836" in keys, "A16+U84.300 耐药应落 FZ-1836"
+    assert groups["FZ-1836"].case_count == 2, \
+        f"U84.300 与主诊断拓展码两条路径应并入同组(2例)，实际 {groups['FZ-1836'].case_count}"
+    assert "FZ-1840" in keys, "A17 耐药应落 FZ-1840"
+    assert "FZ-1829" in keys, "胸廓成形术应命中 FZ-1829"
+    # (C) 烧伤：目录行直出（程度×面积×术式，无年龄维度）
+    for seq in ("FZ-1745", "FZ-1746", "FZ-1747", "FZ-1764"):
+        assert seq in keys, f"烧伤应直出 {seq}，实际 {sorted(keys)}"
+        assert getattr(groups[seq], "national_matched", False) is True
+        assert getattr(groups[seq], "grouping_layer", "") == "诊断辅助细分"
+    # (C-向后兼容) T30.2 → 种子规则条目号 5025（目录烧伤行不含 T30，引擎未命中回落）
+    assert "5025" in keys, "T30.2 应经种子规则回落 5025（向后兼容）"
     # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分
-    assert not any(k.startswith("AUX|BURN") for k in keys), "烧伤不再使用 AUX|BURN 描述键"
     assert any(k.startswith("T31|") for k in keys), "T31 主诊断应走基本规则"
 
     # ③ 与基本规则互不干扰：对照组 K35 走基本规则，不在 ③
-    assert "K35|47.0100|" in keys
-    assert not any(k.startswith("AUX|K35") for k in keys)
-    # ③ 成组层标记：肿瘤/结核为 AUX| 描述键（未加载国家目录库时），烧伤为《函》条目号键
-    aux_keys = [k for k in keys if k.startswith("AUX|")]
-    assert len(aux_keys) == 9, f"③ 未加载国家库时应为 6 肿瘤+3 结核=9 个 AUX 组，实际 {aux_keys}"
-    burn_item_keys = [k for k in keys if k.isdigit() and 5016 <= int(k) <= 5039]
-    assert len(burn_item_keys) == 4, f"烧伤应产出 4 个《函》条目号键，实际 {burn_item_keys}"
-    # (C-一度) T30.100 = 一度烧伤，《函》无对应组 → 不进入诊断辅助细分，回落基本规则
-    assert any(k.startswith("T30") for k in keys), "一度烧伤应回落基本规则(键以 T30 开头)"
-    assert not any(k.isdigit() and 5016 <= int(k) <= 5039
-                   and "T30.100" in getattr(groups[k], "disease_code", "") for k in keys)
+    assert "JC-3625" in keys and groups["JC-3625"].grouping_layer == "基本规则"
+    # 一度烧伤 T30.100 → 基本规则（目录无对应组）
+    assert any(k.startswith("T30") and k != "5025" for k in keys), "一度烧伤应回落基本规则"
+
+
+def test_burn_main_diag_dict_from_attachment():
+    """③ 烧伤主诊断字典以权威附件 burn_degree_dict.xlsx「烧伤程度」sheet 为准（216 条）。
+
+    验证：
+      - 字典覆盖全部 T20–T25 各部位二度/三度/腐蚀伤 + T29(多部位) + T30(未特指) 共 216 条；
+      - 部位特异码正确归类（躯干三度 T21.300→三度单部位；躯干二度腐蚀伤 T21.600→二度腐蚀伤）；
+      - 多部位判定：T29.300→多部位三度，T29.200→多部位二度（附件含类目级 T29.200/300）；
+      - 一度(.0)不在附件 → 不进字典（T30.100 不在）；
+      - classify：部位特异(T21.300)+面积(T31.1)→5019；多部位(T29.200)+T31.1→5037；
+        一度(T30.100)→None；截断码(T30.2)→5025；T30.200X001(不在附件)→None。
+    """
+    gen = LocalDirectoryGenerator(threshold=15)
+    d = gen._burn_main_diag_dict
+
+    # 权威附件全量载入
+    assert len(d) == 216, f"主诊断字典应覆盖全部部位特异码，实际 {len(d)} 条"
+    # 8 个通用/多部位兜底码必在（与附件一致）
+    for code in ("T30.200", "T30.300", "T30.600", "T30.700",
+                 "T29.200X001", "T29.300X001", "T29.600X001", "T29.700X001"):
+        assert code in d, f"主诊断字典应含 {code}"
+
+    # 部位特异码：躯干三度/二度（含腐蚀伤）
+    assert d["T21.300"]["degree"] == "三度" and d["T21.300"]["site"] == "单部位"
+    assert d["T21.200"]["degree"] == "二度" and d["T21.200"]["site"] == "单部位"
+    assert d["T21.600"]["degree"] == "二度" and d["T21.600"]["burn_type"] == "腐蚀伤"
+    assert d["T21.700"]["degree"] == "三度" and d["T21.700"]["burn_type"] == "腐蚀伤"
+    # 其他部位也应覆盖
+    for code in ("T20.300", "T22.300", "T23.300", "T24.300", "T25.300"):
+        assert code in d and d[code]["degree"] == "三度", f"部位特异三度码应覆盖 {code}"
+
+    # 多部位判定（附件含类目级 T29.200/300）
+    assert d["T29.300"]["site"] == "多部位" and d["T29.300"]["degree"] == "三度"
+    assert d["T29.200"]["site"] == "多部位" and d["T29.200"]["degree"] == "二度"
+
+    # 一度(.0)不在附件 → 不进字典
+    assert "T30.100" not in d, "一度烧伤码不应进入主诊断字典"
+
+    # classify：部位特异 + 面积 → 正确 24 组条目号
+    assert gen._classify_burn("T21.300", "T31.1", 35, 0, "", "") == "5019"   # 三度单部位,≥18,10%-20%
+    assert gen._classify_burn("T29.200", "T31.1", 35, 0, "", "") == "5037"   # 多部位二度,≥18,10%-20%
+    assert gen._classify_burn("T30.100", "", 35, 0, "", "") is None          # 一度
+    assert gen._classify_burn("T30.2", "T31.1", 35, 0, "", "") == "5025"     # 截断码→T30.200 二度单部位
+    assert gen._classify_burn("T30.200X001", "", 35, 0, "", "") is None      # 不在附件
 
 
 def test_national_dip_alignment():
-    """①/③ 严格对齐国家目录库（DIP3.0版分组征求地方意见的函）。
+    """①/③ 严格对齐 DIP3.0 版分组方案（新目录引擎，成组键=方案序号）。
 
-    加载 DIP3.0国家目录库.xlsx 后：
-      ① 低出生体重(函4969-4973)：天龄≤28天 + 出生体重 → 直接产出国家 DIP 编码
-         P07-01(<750g)/P07-02(750-999)/P07-03(1000-1499)/P07-04(1500-1999)/P07-05(2000-2499)
-      ③ 肿瘤(函4974-5015)：Z51.1/Z51.8 × C范围(6档) × 治疗组合(7种) → Z51.x-NN
-      ③ 结核(函5040-5061)：A15-A16/A17/A18/A19 × 术式组 × 耐药 → A15-A16-NN 等
-      ③ 烧伤(函5016-5039)：自包含《函》24 组 → 直出条目号 DIP 编码（不依赖 xlsx 导出）
-    未加载国家目录库时仍走描述性键（由前两个用例覆盖，向后兼容）。
+    加载 data/DIP3.0国家目录库.xlsx 后：
+      ① 低出生体重：天龄<29天 + 出生体重分档 → XQ-16(超低)/XQ-17(极低)/XQ-19(低)，
+         national_dip_code 含体重区间（P07-保守治疗--<29天|出生体重XXXX克）；
+      ①-负例：天龄>28天 不进先期 → JC-4478(P07-保守治疗-)；
+      ③ 肿瘤：Z51.1/Z51.8 × C范围 × 手术组合 → FZ-1774/FZ-1793/FZ-1806/FZ-1802；
+      ③ 结核：FZ-1837(非耐药)/FZ-1836(耐药,双路径同组)/FZ-1840(A17)/FZ-1829(胸廓成形)；
+      ③ 烧伤：T21.2+T31.0 → FZ-1745（目录烧伤行主诊断=T20-T25 部位码）。
+    引擎未命中时回落内置种子规则描述性键（向后兼容）。
     """
     rows = []
 
@@ -626,69 +751,70 @@ def test_national_dip_alignment():
             rows.append(row)
 
     # ① 低出生体重：三个体重档
-    add("P07.0", **{"天龄": 10, "出生体重": 1400})   # 极低 → P07-03
-    add("P07.0", **{"天龄": 3, "出生体重": 800})     # 超低 → P07-02
-    add("P07.1", **{"天龄": 20, "出生体重": 2300})   # 低 → P07-05
-    # ①-负例：天龄>28天 不进先期 → 基本规则
+    add("P07.0", **{"天龄": 10, "出生体重": 1400})   # 极低 → XQ-17
+    add("P07.0", **{"天龄": 3, "出生体重": 800})     # 超低 → XQ-16
+    add("P07.1", **{"天龄": 20, "出生体重": 2300})   # 低 → XQ-19
+    # ①-负例：天龄>28天 不进先期 → JC-4478(P07-保守治疗-)
     add("P07.0", **{"天龄": 40, "出生体重": 1400})
-    # ③ 肿瘤：DIP 编码 = 主诊断 × C范围 × 治疗组合
-    add("Z51.1", relop="99.2503", reldx="C80")                              # → Z51.1-23
-    add("Z51.1", relop="99.2503+99.2800x006+99.2800x005", reldx="C91")      # → Z51.1-42
-    add("Z51.8", relop="99.2800x005", reldx="C90")                          # → Z51.8-40
-    add("Z51.8", relop="99.2800x006+99.2800x005", reldx="C81")              # → Z51.8-36
-    # ③-肿瘤降级：无治疗操作 → 国家库无对应行，保持描述性键
-    add("Z51.1", reldx="C80")
+    # ③ 肿瘤：DIP 编码 = 主诊断 × 手术组合 × C范围
+    add("Z51.1", op="99.2503", reldx="C80")                                  # → FZ-1774
+    add("Z51.1", op="99.2503+99.2800x006+99.2800x005", reldx="C91")          # → FZ-1793
+    add("Z51.8", op="99.2800x005", reldx="C90")                              # → FZ-1806
+    add("Z51.8", op="99.2800x006+99.2800x005", reldx="C81")                  # → FZ-1802
     # ③ 结核：耐药标志 × 术式组
-    add("A15.1")                                    # 非耐药无术式 → A15-A16-00
-    add("A16", reldx="U84.300")                     # 耐药(U84.300) → A15-A16-02
-    add("A15.000x010")                              # 耐药(主诊断拓展码) → A15-A16-02
-    add("A17", reldx="U84.300")                     # → A17-02
-    add("A15.1", op="34.0401")                      # 非耐药+胸廓成形术 → A15-A16-12
-    # ③ 烧伤：自包含《函》24 组（程度/面积取自 ICD 名称，不依赖 xlsx）→ 直出条目号 5025
-    add("T30.2", reldx="T31.1", **{"年龄": 35})
+    add("A15.1")                                    # 非耐药无术式 → FZ-1837
+    add("A16", reldx="U84.300")                     # 耐药(U84.300) → FZ-1836
+    add("A15.000x010")                              # 耐药(主诊断拓展码) → FZ-1836
+    add("A17", reldx="U84.300")                     # → FZ-1840
+    add("A15.1", op="34.0401")                      # 非耐药+胸廓成形术 → FZ-1829
+    # ③ 烧伤：目录行 T20-T25 部位码 × T31/T32 面积档
+    add("T21.2", reldx="T31.0")                     # → FZ-1745
     # 对照：普通病种走基本规则
-    add("K35.9", op="47.0100", n=2)
+    add("K35.9", op="47.0100", n=2)                 # → JC-3625
 
     df = pd.DataFrame(rows)
-    gen = LocalDirectoryGenerator(threshold=1)
-    gen.load_national_directory("F:/DIP/data/DIP3.0国家目录库.xlsx")
+    gen = LocalDirectoryGenerator(threshold=1)  # 引擎在 __init__ 自动加载 data/DIP3.0国家目录库.xlsx
     groups = gen.cluster_records_to_groups(df)
     keys = list(groups.keys())
 
-    # ① 低出生体重 → 国家 DIP 编码直出
-    for dip in ("P07-02", "P07-03", "P07-05"):
-        assert dip in keys, f"低出生体重应产出国家编码 {dip}，实际 {sorted(keys)}"
-        assert getattr(groups[dip], "national_matched", False) is True, \
-            f"{dip} 应标记 national_matched"
-        assert getattr(groups[dip], "national_dip_code", None) == dip
+    # ① 低出生体重 → 方案序号直出，national_dip_code 含体重区间
+    for seq, weight_label in (("XQ-16", "出生体重0-999克"), ("XQ-17", "出生体重1000-1499克"),
+                              ("XQ-19", "出生体重2000-2499克")):
+        assert seq in keys, f"低出生体重应直出 {seq}，实际 {sorted(keys)}"
+        g = groups[seq]
+        assert getattr(g, "national_matched", False) is True
+        assert getattr(g, "national_seq", "") == seq
+        assert weight_label in g.national_dip_code, \
+            f"{seq} 应含 {weight_label}，实际 {g.national_dip_code}"
+        assert g.grouping_layer == "先期分组"
     assert not any(k.startswith("PRI|LBW|") for k in keys), \
         "加载国家目录库后不应再出现描述性 LBW 键"
-    # ①-负例：天龄40天 → 基本规则(P07 开头)
-    assert any(k.startswith("P07|") for k in keys), "超28天新生儿应走基本规则"
+    # ①-负例：天龄40天 → JC-4478(P07-保守治疗-)
+    assert "JC-4478" in keys, "超28天新生儿应按保守治疗入 JC-4478"
 
-    # ③ 肿瘤 → 国家 DIP 编码直出
-    for dip in ("Z51.1-23", "Z51.1-42", "Z51.8-40", "Z51.8-36"):
-        assert dip in keys, f"肿瘤细分应产出国家编码 {dip}，实际 {sorted(keys)}"
-        assert getattr(groups[dip], "national_matched", False) is True
-    # ③-肿瘤降级：无治疗操作组合在国家库无行 → 描述性键
-    assert "AUX|TUMOR|C80|其他" in keys, "无治疗操作应降级为描述性键"
+    # ③ 肿瘤 → 方案序号直出，DIP 编码以 Z51.x 开头
+    for seq in ("FZ-1774", "FZ-1793", "FZ-1806", "FZ-1802"):
+        assert seq in keys, f"肿瘤细分应直出 {seq}，实际 {sorted(keys)}"
+        assert getattr(groups[seq], "national_matched", False) is True
+        assert groups[seq].national_dip_code.startswith("Z51."), \
+            f"{seq} DIP 编码应以 Z51. 开头，实际 {groups[seq].national_dip_code}"
 
-    # ③ 结核 → 国家 DIP 编码直出
-    assert "A15-A16-00" in keys
-    assert "A15-A16-02" in keys
-    assert groups["A15-A16-02"].case_count == 2, \
-        f"U84.300 与主诊断拓展码应并入 A15-A16-02(2例)，实际 {groups['A15-A16-02'].case_count}"
-    assert "A17-02" in keys
-    assert "A15-A16-12" in keys, f"胸廓成形术应命中 A15-A16-12，实际 {sorted(keys)}"
+    # ③ 结核 → 方案序号直出
+    assert "FZ-1837" in keys, "A15.1 非耐药应落 FZ-1837"
+    assert "FZ-1836" in keys, "A16 耐药应落 FZ-1836"
+    assert groups["FZ-1836"].case_count == 2, \
+        f"U84.300 与主诊断拓展码应并入 FZ-1836(2例)，实际 {groups['FZ-1836'].case_count}"
+    assert "FZ-1840" in keys
+    assert "FZ-1829" in keys, f"胸廓成形术应命中 FZ-1829，实际 {sorted(keys)}"
     assert not any(k.startswith("AUX|TB|") for k in keys), \
         "加载国家目录库后结核不应再出现描述性键"
 
-    # ③ 烧伤：自包含《函》24 组 → 直出条目号 DIP 编码（不依赖 xlsx）
-    assert "5025" in keys, "烧伤应直出条目号 5025"
-    assert getattr(groups["5025"], "national_matched", False) is True
+    # ③ 烧伤：目录行直出
+    assert "FZ-1745" in keys, "烧伤 T21.2+T31.0 应直出 FZ-1745"
+    assert getattr(groups["FZ-1745"], "national_matched", False) is True
 
     # 对照：基本规则不受影响
-    assert "K35|47.0100|" in keys
+    assert "JC-3625" in keys
 
 
 def test_grouping_layer_order():
@@ -716,17 +842,17 @@ def test_grouping_layer_order():
             row.update(extra)
             rows.append(row)
 
-    # ① 先期分组：低出生体重（天龄10天，出生体重1400g）
+    # ① 先期分组：低出生体重（天龄10天，出生体重1400g）→ XQ-17
     add("P07.1", n=3, **{"day_age": 10, "birth_weight": 1400})
-    # ① 先期分组：器官移植（肾移植 55.6）
-    add("N18.5", op="55.6", n=3)
-    # ② 并项规则：诊断并项（心绞痛 I20.x → 3 位码归并）
-    add("I20.0", n=3)
-    # ③ 诊断辅助细分：肿瘤放化疗（未加载国家目录→描述性键，但层次仍为诊断辅助细分）
-    add("Z51.1", relop="99.2503", reldx="C80", n=3)
-    # ④ 基本规则：普通手术（阑尾炎 + 阑尾切除）
-    add("K35.8", op="47.0", n=3)
-    # 综合病种：未达阈值的低频病种（1 例）
+    # ① 先期分组：器官移植（肾移植 55.6901 → XQ-6）
+    add("N18.5", op="55.6901", n=3)
+    # ② 并项规则：I20.0+36.0700 → BX-609（诊断3位 I20 并项）
+    add("I20.0", op="36.0700", n=3)
+    # ③ 诊断辅助细分：肿瘤放化疗（Z51.1+99.2503+C80 → FZ-1774）
+    add("Z51.1", op="99.2503", reldx="C80", n=3)
+    # ④ 基本规则：普通手术（阑尾炎 + 阑尾切除 → JC-3625）
+    add("K35.8", op="47.0100", n=3)
+    # 综合病种：未达阈值的低频病种（1 例，国家目录无对应行）
     add("Q89.9", op="", n=1)
 
     df = pd.DataFrame(rows)
@@ -766,6 +892,399 @@ def test_grouping_layer_order():
         "综合病种应排在所有核心病种之后"
 
 
+# =====================================================================
+# B5 / B6 / B7 整改回归测试（核心病种辅助分型测算）
+# =====================================================================
+
+def _aux_rows(specs, dx="K35.9", name="急性阑尾炎"):
+    """构造辅助分型测试数据。
+
+    specs: list of (cost, related_diag, n, **extra)
+    返回 pandas.DataFrame，字段与 test_auxiliary_typing 一致。
+    """
+    rows = []
+    for cost, related, n, *rest in specs:
+        extra = rest[0] if rest else {}
+        for i in range(n):
+            row = {
+                "主要诊断代码": dx, "主要诊断名称": name,
+                "主要手术操作代码": "", "主要手术操作名称": "",
+                "相关诊断代码": related,
+                "医疗总费用": cost + i * 10, "药品费用": 1000, "治疗费用": 1000,
+                "住院天数": extra.get("los", 5), "年龄": extra.get("age", 45),
+                "ICU天数": extra.get("icu", 0), "出院状态": "医嘱离院",
+            }
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_b5_high_cost_baseline_is_score_standard():
+    """B5：高费用判定基准须为「分值费用标准」= 未测算辅助分型的核心病种的平均费用(mi)，
+
+    而非任意平均费用倍数（如旧代码的 2×avg）。
+    - 恶性肿瘤 record，total_cost 落在 (3×avg, 3×2×avg) 之间：
+      若用错误基准 2×avg（阈值 3×2×avg=6×avg），判为「其他」；
+      若用正确基准 avg（阈值 3×avg），判为「高费用类型一」。
+    - 另验证显式传入 RW×点值（0.5 × 60000 = 30000 = avg）时与 mi 等价。
+    """
+    from decimal import Decimal
+    from src.core.auxiliary_directory import AuxiliaryDirectoryCalculator
+
+    calc = AuxiliaryDirectoryCalculator()
+    avg = Decimal("30000")
+    # total_cost=120000 ∈ (3×avg=90000, 3×2×avg=180000) → 用 avg 判高费用、用 2×avg 判其他
+    rec = __import__("src.models.models", fromlist=["MedicalRecord"]).MedicalRecord(
+        record_id="R9", settlement_id="S9", patient_id="P9", visit_id="V9",
+        hospital_code="H001", hospital_name="测试医院",
+        main_diag_code="C34.9", main_diag_name="肺恶性肿瘤",
+        total_cost=Decimal("120000"), drug_cost=Decimal("10000"),
+        treatment_cost=Decimal("70000"), discharge_status="医嘱离院", los=5,
+    )
+    # 正确口径：分值费用标准 = 未测算辅助分型的核心病种平均费用 avg
+    res = calc.calculate_all_auxiliary_coefficients(
+        record=rec, disease_avg_cost=avg
+    )
+    assert res["severity"]["level"] == "高费用类型一", \
+        f"B5 失败：应以分值费用标准(=avg)判高费用，实际 {res['severity']['level']}"
+
+    # 显式传入 RW×点值（0.5 × 60000 = 30000，等价于 avg）作为支付标准基准
+    res2 = calc.calculate_all_auxiliary_coefficients(
+        record=rec, disease_avg_cost=avg, rw=Decimal("0.5"), point_value=Decimal("60000")
+    )
+    assert res2["severity"]["level"] == "高费用类型一", \
+        f"B5 失败：RW×点值 显式路径应等价，实际 {res2['severity']['level']}"
+
+
+def test_b6_tcm_and_bed_day_excluded():
+    """B6：中医优势病种 / 床日病种不纳入辅助分型（标记或码集命中即跳过）。
+
+    - 对照组（普通 K35.9 双峰）：正常触发拆分；
+    - 同数据但 main_diag_code 命中 tcm_disease_codes → 不拆分；
+    - 同数据但某核心病种 is_tcm_advantage=True → 不拆分。
+    """
+    specs = [
+        (8000, "", 20),
+        (40000, "R57.0", 10, {"los": 10}),  # 重度+高费用 → 触发
+    ]
+
+    # 1) 普通病种应触发拆分
+    df = _aux_rows(specs)
+    gen = LocalDirectoryGenerator(threshold=10)
+    groups = gen.cluster_records_to_groups(df)
+    typed = gen.apply_auxiliary_typing(groups, min_total_cases=15, min_type_cases=5,
+                                       cv_mode="improvement")
+    subs = [g for g in typed.values()
+            if g.main_diag_code == "K35.9" and g.auxiliary_parent_code]
+    assert subs, "对照组 K35.9 双峰应触发辅助分型拆分"
+    assert any(g.auxiliary_type == "严重程度" for g in subs)
+
+    # 2) 命中 tcm_disease_codes → 跳过拆分
+    df2 = _aux_rows(specs, dx="Z98.9", name="中医优势病种示例")
+    gen2 = LocalDirectoryGenerator(threshold=10)
+    g2 = gen2.cluster_records_to_groups(df2)
+    typed2 = gen2.apply_auxiliary_typing(
+        g2, min_total_cases=15, min_type_cases=5,
+        tcm_disease_codes={"Z98.9"}, cv_mode="improvement",
+    )
+    subs2 = [g for g in typed2.values()
+             if g.main_diag_code == "Z98.9" and g.auxiliary_parent_code]
+    assert not subs2, "B6 失败：命中中医优势码集的病种不应拆分"
+    z = [g for g in typed2.values() if g.main_diag_code == "Z98.9"]
+    assert len(z) == 1 and not z[0].auxiliary_split
+
+    # 3) is_tcm_advantage 标记 → 跳过拆分
+    df3 = _aux_rows(specs)
+    gen3 = LocalDirectoryGenerator(threshold=10)
+    g3 = gen3.cluster_records_to_groups(df3)
+    target = next(g for g in g3.values()
+                  if g.group_type == GroupType.CORE and not g.excluded)
+    target.is_tcm_advantage = True
+    typed3 = gen3.apply_auxiliary_typing(g3, min_total_cases=15, min_type_cases=5,
+                                         cv_mode="improvement")
+    subs3 = [g for g in typed3.values()
+             if g.main_diag_code == "K35.9" and g.auxiliary_parent_code]
+    assert not subs3, "B6 失败：标记 is_tcm_advantage 的病种不应拆分"
+
+
+def test_b7_multi_rule_competition_by_trigger_coefficient():
+    """B7：多维度触发时，纳入「触发系数(=mj/M)最高」的维度（多规则竞争）。
+
+    构造两组对比数据，使严重程度与 CCI 两个维度均触发，但触发系数高低互换：
+      - 场景A：严重程度触发系数 > CCI → 选「严重程度」；
+      - 场景B：CCI 触发系数 > 严重程度 → 选「CCI」。
+    验证 best_dim 随触发系数最高者变化。
+    """
+    # 场景A：高费用病例集中于「重度」(R57.0, CCI无) → 严重程度触发系数高
+    specA = [
+        (8000, "", 10),                          # 轻度 / CCI无
+        (50000, "R57.0", 8, {"los": 10}),        # 重度(高费用) / CCI无
+        (30000, "C34.1,I500,J441,E119", 12),     # 轻度 / CCI极严重(中等费用)
+    ]
+    # 场景B：高费用病例集中于「CCI极严重」(非重度) → CCI 触发系数高
+    specB = [
+        (8000, "R57.0", 10, {"los": 10}),        # 重度(低费用) / CCI无
+        (50000, "C34.1,I500,J441,E119", 8),      # 轻度 / CCI极严重(高费用)
+        (30000, "", 12),                          # 轻度 / CCI无
+    ]
+
+    for label, spec, expect_dim in [
+        ("A-严重程度胜出", specA, "严重程度"),
+        ("B-CCI胜出", specB, "CCI"),
+    ]:
+        df = _aux_rows(spec)
+        gen = LocalDirectoryGenerator(threshold=10)
+        groups = gen.cluster_records_to_groups(df)
+        typed = gen.apply_auxiliary_typing(
+            groups, min_total_cases=15, min_type_cases=5, cv_improvement_pct=0.20,
+            cv_mode="improvement",
+        )
+        # 该 K35.9 应被拆分为子组（两个维度均触发），且最优维度=期望
+        subs = [g for g in typed.values()
+                if g.main_diag_code == "K35.9" and g.auxiliary_parent_code]
+        assert subs, f"{label}：应触发辅助分型拆分"
+        assert all(g.auxiliary_type == expect_dim for g in subs), \
+            f"{label}：多规则竞争应选触发系数最高的维度「{expect_dim}」，" \
+            f"实际 {[g.auxiliary_type for g in subs]}"
+        # 触发评估报告应记录该维度 triggered=是 且其触发系数最高
+        # （新成组键下 disease_code=方案序号，以 main_diag_code 定位病种）
+        rep = [r for r in gen.auxiliary_trigger_report
+               if r.get("main_diag_code") == "K35.9"]
+        trig = [r for r in rep if r["triggered"] == "是"]
+        assert any(r["dimension"] == expect_dim for r in trig), \
+            f"{label}：报告应记录「{expect_dim}」维度触发"
+
+
+def test_exporter_malignant_high_cost_uses_mi():
+    """Web 单条路径：恶性肿瘤高费用判定须用 mi（未拆分核心病种均值），而非恒为 0。
+
+    之前 exporter 传 cost_standard=0，导致高费用类型一/二在 Web 端永不触发。
+    """
+    from decimal import Decimal
+    from src.core.auxiliary_directory_exporter import AuxiliaryDirectoryExporter
+    MedicalRecord = __import__("src.models.models", fromlist=["MedicalRecord"]).MedicalRecord
+
+    def mk(rid, cost, treat, drug=0, dx="C34.9"):
+        return MedicalRecord(
+            record_id=rid, settlement_id=rid, patient_id=rid, visit_id=rid,
+            hospital_code="H001", hospital_name="t",
+            main_diag_code=dx, main_diag_name="肺恶性肿瘤",
+            total_cost=Decimal(str(cost)), treatment_cost=Decimal(str(treat)),
+            drug_cost=Decimal(str(drug)), discharge_status="医嘱离院", los=5,
+        )
+    # 3 条低费用 + 1 条高费用（治疗费占比≥50%）
+    recs = [mk(f"L{i}", 10000, 8000) for i in range(3)] + [mk("H1", 120000, 70000)]
+    # mi = (10000×3 + 120000) / 4 = 37500；120000 ≥ 3×37500=112500 → 高费用类型一
+    # 注：classify_records 现已改为子组级聚合（不直接暴露逐病例标签），
+    # 此处直接验证恶性肿瘤高费用判定须用 mi 而非恒为 0 的回归点。
+    from src.core.auxiliary_directory import AuxiliaryDirectoryCalculator
+    calc = AuxiliaryDirectoryCalculator()
+    mi = Decimal("37500")
+    hi = calc.severity_classifier.classify_malignant_tumor(
+        mk("H1", 120000, 70000), mi, mi)
+    lo = calc.severity_classifier.classify_malignant_tumor(
+        mk("L0", 10000, 8000), mi, mi)
+    assert hi["level"] == "高费用类型一", \
+        f"高费用病例应判『高费用类型一』，实际 {hi['level']}"
+    assert lo["level"] != "高费用类型一", \
+        f"低费用病例不应判高费用，实际 {lo['level']}"
+
+
+def test_auxiliary_typing_default_absolute_mode():
+    """验证 CLI 默认使用 absolute CV 模式（测试阶段口径）。
+
+    默认参数：min_total_cases=10, cv_mode="absolute", cv_threshold=0.6。
+    触发报告应记录 cv_mode="absolute"；后期切换 cv_mode="improvement" 可恢复改善率口径。
+    """
+    rows = []
+    def add(dx, name, cost, n, related="", los=5, age_=45, icu_=0, status="医嘱离院"):
+        for i in range(n):
+            rows.append({
+                "主要诊断代码": dx, "主要诊断名称": name,
+                "主要手术操作代码": "", "主要手术操作名称": "",
+                "相关诊断代码": related,
+                "医疗总费用": cost + i * 10, "药品费用": 1000, "治疗费用": 1000,
+                "住院天数": los, "年龄": age_, "ICU天数": icu_, "出院状态": status,
+            })
+    # 20 例双峰 → 默认 absolute 模式下评估
+    add("K35.9", "急性阑尾炎", 8000, 12)
+    add("K35.9", "急性阑尾炎", 40000, 8, related="R57.0", los=10)
+
+    df = pd.DataFrame(rows)
+    gen = LocalDirectoryGenerator(threshold=10)
+    groups = gen.cluster_records_to_groups(df)
+    # 不传 cv_mode → 使用默认 "absolute"
+    typed = gen.apply_auxiliary_typing(groups)
+
+    # 触发报告必须存在且记录了 cv_mode
+    assert hasattr(gen, "auxiliary_trigger_report")
+    assert len(gen.auxiliary_trigger_report) > 0
+    modes = {r.get("cv_mode") for r in gen.auxiliary_trigger_report}
+    assert modes == {"absolute"}, f"默认 cv_mode 应为 absolute，实际 {modes}"
+    # cv_threshold 字段应为 0.6
+    thresholds = {r.get("cv_threshold") for r in gen.auxiliary_trigger_report}
+    assert thresholds == {0.6}, f"默认 cv_threshold 应为 0.6，实际 {thresholds}"
+
+
+def test_derive_icu_days_rule_charge_item():
+    """监护病房住院天数·判断1（charge_item，默认）：含重症监护/层流洁净床位费收费项目
+    + 特级护理天数 → icu_days = 特级护理天数；无对应收费项目则回落既有 icu_days。"""
+    gen = LocalDirectoryGenerator(threshold=15)  # 默认 icu_days_rule='charge_item'
+    assert gen.icu_days_rule == "charge_item"
+    # 重症监护床位费 + 特级护理5天 → 5
+    assert gen._derive_icu_days(0, 5, "", {"011105000060000"}) == 5
+    # 层流洁净床位费 + 特级护理3天 → 3
+    assert gen._derive_icu_days(0, 3, "", {"011105000070000"}) == 3
+    # 无对应收费项目（即便有特级护理）→ 回落 0
+    assert gen._derive_icu_days(0, 5, "", set()) == 0
+    assert gen._derive_icu_days(0, 5, "", {"990000000000000"}) == 0
+    # 与既有 icu_days(10) 取大值：severe 且 nurscare=5 < 10 → 10
+    assert gen._derive_icu_days(10, 5, "", {"011105000060000"}) == 10
+
+
+def test_derive_icu_days_rule_ward_type():
+    """监护病房住院天数·判断2（ward_type）：重症监护病房类型非空 + 特级护理天数
+    → icu_days = 特级护理天数；病房类型为空则回落既有 icu_days。"""
+    gen = LocalDirectoryGenerator(threshold=15, icu_days_rule="ward_type")
+    assert gen.icu_days_rule == "ward_type"
+    # 病房类型非空 + 特级护理8天 → 8
+    assert gen._derive_icu_days(0, 8, "外科重症监护病房(SICU)", set()) == 8
+    # 病房类型为空 → 回落 0
+    assert gen._derive_icu_days(0, 8, "", set()) == 0
+
+
+def test_derive_icu_days_rule_switch_isolated():
+    """两种判断方式互不串扰：切换规则后，另一种规则的输入不再生效。"""
+    # 判断2 模式：忽略收费项目码
+    gen2 = LocalDirectoryGenerator(threshold=15, icu_days_rule="ward_type")
+    assert gen2._derive_icu_days(0, 5, "", {"011105000060000"}) == 0
+    # 判断1(默认)模式：忽略病房类型
+    gen1 = LocalDirectoryGenerator(threshold=15)
+    assert gen1._derive_icu_days(0, 5, "SICU", set()) == 0
+
+
+def test_icu_days_rule_flows_through_cluster():
+    """收费项目/特级护理天数经成组流程推导为成员记录 icu_days（两种规则各验一条）。"""
+    import pandas as pd
+    base = {"结算ID": "S1", "主要诊断代码": "I21.900",
+            "主要手术操作代码": "00.2400", "total_cost": 10000}
+    # 判断1：收费项目含重症监护床位费 + 特级护理5天
+    df1 = pd.DataFrame([{**base, "spga_nurscare_days": 5,
+                         "charge_item_codes": "011105000060000"}])
+    g1 = LocalDirectoryGenerator(threshold=1)
+    groups1 = g1.cluster_records_to_groups(df1)
+    rec1 = next(g.member_records[0] for g in groups1.values()
+                if g.main_diag_code == "I21.900" and g.member_records)
+    assert rec1["icu_days"] == 5
+
+    # 判断2：重症监护病房类型非空 + 特级护理8天
+    df2 = pd.DataFrame([{**base, "spga_nurscare_days": 8,
+                         "scs_cutd_ward_type": "SICU"}])
+    g2 = LocalDirectoryGenerator(threshold=1, icu_days_rule="ward_type")
+    groups2 = g2.cluster_records_to_groups(df2)
+    rec2 = next(g.member_records[0] for g in groups2.values()
+                if g.main_diag_code == "I21.900" and g.member_records)
+    assert rec2["icu_days"] == 8
+
+
+def test_merge_rule1_driven_by_national_3digit():
+    """并项规则判定改为按 BX 名录查表（DIP3.0 新方案口径）。
+
+    旧「主要诊断=3位类目码 即并项」的判据已废弃：
+      - J18.9（无手术）→ JC-3414(J18-保守治疗-) 基本规则，不再因 3 位类目归并项层；
+      - 并项层由 BX 名录驱动：I20.0+36.0700 → BX-609(I20-36.06/36.07 族并项)；
+      - 其它层独占的 3 位类目不被误判：P07.0(LBW)→XQ-17 先期、A18.0(结核)→FZ 诊断辅助细分；
+      - 命中 BX/JC 后 national_seq / national_dip_code 在 _build_group 回填。
+    """
+    gen = LocalDirectoryGenerator(threshold=2)
+
+    # 1) J18.9 无手术 → 基本规则保守治疗行（3位类目判据已废弃）
+    key, layer = gen._refine_core_group_key("J18.9", "", "", "")
+    assert (key, layer) == ("JC-3414", "基本规则"), \
+        f"J18.9 无手术应落 JC-3414 基本规则, 实际 {layer}/{key}"
+
+    # 2) 并项层由 BX 名录驱动
+    key, layer = gen._refine_core_group_key("I20.0", "36.0700", "", "")
+    assert (key, layer) == ("BX-609", "并项规则"), \
+        f"I20.0+36.0700 应命中 BX-609 并项规则, 实际 {layer}/{key}"
+
+    # 3) 其它层独占的 3 位类目不误归并项
+    key, layer = gen._refine_core_group_key("A18.0", "", "", "")
+    assert layer == "诊断辅助细分", f"A18.0(结核) 应归诊断辅助细分, 实际 {layer}/{key}"
+    key, layer = gen._refine_core_group_key("P07.0", "", "", "",
+                                            day_age=10, birth_weight=1400)
+    assert layer == "先期分组", f"P07.0(LBW) 应归先期分组, 实际 {layer}/{key}"
+
+    # 4) 成组后国家目录元数据回填（national_seq / national_dip_code）
+    rows = []
+    for i in range(3):
+        rows.append({
+            "主要诊断代码": "J18.9", "主要诊断名称": "肺炎",
+            "主要手术操作代码": "", "主要手术操作名称": "",
+            "医疗总费用": 10000 + i * 10,
+        })
+    df = pd.DataFrame(rows)
+    groups = gen.cluster_records_to_groups(df)
+    j18 = [g for g in groups.values() if g.national_seq == "JC-3414"]
+    assert j18, f"应存在 JC-3414(J18-保守治疗-) 组，实际 {sorted(groups.keys())}"
+    g = j18[0]
+    assert g.national_matched is True
+    assert str(g.national_dip_code).startswith("J18"), \
+        f"J18 组国目 DIP 应以 J18 开头, 实际 {g.national_dip_code}"
+
+
+def test_priority_merge_aux_respect_threshold():
+    """①②③④ 四层成组一律受核心病种阈值(分组阈值)约束。
+
+    验证：未达 threshold 的 ①先期分组 / ②并项规则 / ③诊断辅助细分 组，与
+    ④基本规则 一致，折叠进入综合病种（不再"恒为核心"）。达到阈值的同类组
+    仍保留为对应层的核心病种。
+    """
+    TH = 5
+
+    def _make(dx, op="", relop="", reldx="", day_age=0, birth_weight=0, age=0, n=1):
+        rows = []
+        for _ in range(n):
+            rows.append({
+                "main_diag_code": dx, "main_diag_name": "",
+                "main_oprn_code": op, "main_oprn_name": "",
+                "related_oprn_code": relop, "related_oprn_name": "",
+                "related_diag_code": reldx,
+                "total_cost": 10000,
+                "day_age": day_age, "birth_weight": birth_weight, "age": age,
+            })
+        return pd.DataFrame(rows)
+
+    # 各层"未达阈值"(1 例)应折叠为综合病种
+    low_specs = [
+        ("先期分组", dict(dx="P07.0", day_age=10, birth_weight=1400, n=1)),
+        ("并项规则", dict(dx="I20.0", op="36.0700", n=1)),
+        ("诊断辅助细分", dict(dx="T30.2", reldx="T31.1", age=35, n=1)),
+        ("基本规则", dict(dx="K35.9", op="47.0100", n=1)),
+    ]
+    for layer, kw in low_specs:
+        gen = LocalDirectoryGenerator(threshold=TH)
+        groups = gen.cluster_records_to_groups(_make(**kw))
+        core = [g for g in groups.values() if g.group_type.value == "核心病种"]
+        assert not any(g.grouping_layer == layer for g in core), \
+            f"{layer} 未达阈值(1例) 不应保留为核心病种，应折叠入综合病种"
+        assert any(g.group_type.value == "综合病种" for g in groups.values()), \
+            f"{layer} 未达阈值(1例) 应进入综合病种"
+
+    # 各层"达阈值"(10 例)应保留为对应层核心病种
+    high_specs = [
+        ("先期分组", dict(dx="P07.0", day_age=10, birth_weight=1400, n=10)),
+        ("并项规则", dict(dx="I20.0", op="36.0700", n=10)),
+        ("诊断辅助细分", dict(dx="T30.2", reldx="T31.1", age=35, n=10)),
+        ("基本规则", dict(dx="K35.9", op="47.0100", n=10)),
+    ]
+    for layer, kw in high_specs:
+        gen = LocalDirectoryGenerator(threshold=TH)
+        groups = gen.cluster_records_to_groups(_make(**kw))
+        core = [g for g in groups.values() if g.group_type.value == "核心病种"]
+        assert any(g.grouping_layer == layer for g in core), \
+            f"{layer} 达阈值(10例) 应保留为核心病种"
+
+
 if __name__ == "__main__":
     test_local_directory_generation()
     test_extreme_case_trimming()
@@ -775,6 +1294,16 @@ if __name__ == "__main__":
     test_diagnostic_auxiliary_subdivision()
     test_national_dip_alignment()
     test_grouping_layer_order()
-    print("test_local_directory.py 全部 8 个用例通过")
+    test_priority_merge_aux_respect_threshold()
+    test_b5_high_cost_baseline_is_score_standard()
+    test_b6_tcm_and_bed_day_excluded()
+    test_b7_multi_rule_competition_by_trigger_coefficient()
+    test_exporter_malignant_high_cost_uses_mi()
+    test_auxiliary_typing_default_absolute_mode()
+    test_derive_icu_days_rule_charge_item()
+    test_derive_icu_days_rule_ward_type()
+    test_derive_icu_days_rule_switch_isolated()
+    test_icu_days_rule_flows_through_cluster()
+    print("test_local_directory.py 全部 18 个用例通过")
 
 

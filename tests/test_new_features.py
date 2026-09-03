@@ -110,11 +110,14 @@ def test_auxiliary_directory_export():
     records = generate_test_records()
     exporter = AuxiliaryDirectoryExporter()
 
+    # classify_records 现已改为子组级聚合（核心病种 × 维度 × 子型），
+    # 返回 AuxiliarySubgroup 列表（数量 <= 记录数，无显著差异的病种不产生子组）。
     classifications = exporter.classify_records(records)
-    assert len(classifications) == 35, f"分型结果应 35 条，实际 {len(classifications)}"
-    for c in classifications:
-        assert c.max_coefficient is not None and c.max_coefficient > 0, "最高调节系数应 > 0"
-        assert c.cci_type is not None and c.severity_type is not None and c.age_type is not None
+    assert isinstance(classifications, list)
+    assert len(classifications) <= 35, f"子组数应 <= 35，实际 {len(classifications)}"
+    for s in classifications:
+        assert s.coefficient is not None and s.coefficient > 0, "辅助分型系数应 > 0"
+        assert s.case_count > 0, "子组病例数应 > 0"
 
     output_path = str(get_output_dir() / "test_auxiliary_directory.xlsx")
     exporter.export_to_excel(classifications, output_path)

@@ -116,6 +116,14 @@ class SettlementDataImporter:
         # 重症监护
         'icu_dura': 'icu_days',  # 重症监护时长
         'vent_used_dura': 'ventilator_days',  # 呼吸机使用时长
+
+        # 重症判断补充字段（收费项目 / 病房类型 + 特级护理天数）
+        'spga_nurscare_days': 'spga_nurscare_days',  # 特级护理天数
+        '特级护理天数': 'spga_nurscare_days',
+        'scs_cutd_ward_type': 'scs_cutd_ward_type',  # 重症监护病房类型
+        '重症监护病房类型': 'scs_cutd_ward_type',
+        'charge_item_codes': 'charge_item_codes',  # 收费项目编码（'|' 分隔）
+        '收费项目编码': 'charge_item_codes',
         
         # DIP分组信息
         'dip_code': 'dip_disease_code',  # DIP编码
@@ -467,7 +475,11 @@ class SettlementDataImporter:
                 discharge_status=get_value('discharge_status'),
                 dip_disease_code=get_value('dip_disease_code'),
                 dip_disease_name=get_value('dip_disease_name'),
-                disease_value=get_decimal('disease_value')
+                disease_value=get_decimal('disease_value'),
+                # 重症判断补充字段（收费项目 / 病房类型 + 特级护理天数）
+                spga_nurscare_days=get_int('spga_nurscare_days'),
+                scs_cutd_ward_type=get_value('scs_cutd_ward_type'),
+                charge_item_codes=self._split_fee_codes(get_value('charge_item_codes')),
             )
             
             # 存储其他诊断和其他手术信息（用于后续处理）
@@ -500,6 +512,18 @@ class SettlementDataImporter:
     def import_from_dataframe(self, df: pd.DataFrame) -> ImportResult:
         """从DataFrame导入数据"""
         return self._process_dataframe(df)
+
+    @staticmethod
+    def _split_fee_codes(value) -> List[str]:
+        """将收费项目编码字段解析为编码列表。
+
+        兼容：'|' 分隔字符串（Excel/CSV 合并导出）、已为 list/set/tuple、或空值。
+        """
+        if value is None:
+            return []
+        if isinstance(value, (list, set, tuple)):
+            return [str(c).strip() for c in value if str(c).strip()]
+        return [c.strip() for c in str(value).split('|') if c.strip()]
     
     def _map_item(self, item: Dict) -> Dict:
         """将单条记录的中文/4101A 字段名映射为内部英文键（与 import_from_dataframe 一致）。"""

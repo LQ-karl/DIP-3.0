@@ -95,31 +95,78 @@ class HospitalCoefficientSelector:
         "未定级": Decimal("1.0")
     }
     
-    # 基层病种列表（不区分医疗机构调节系数，实施同病同治同价）
-    BASIC_DISEASE_GROUPS = [
-        "A01", "A09", "B25", "D50", "E10", "E11", "E14",
-        "G40", "G43", "I10", "I20", "I25", "I50", "J06", "J18",
-        "K21", "K25", "K29", "K35", "K40", "K41", "K80", "K81",
-        "L03", "M54", "N10", "N20", "N39", "O80", "O82",
-        "P07", "Q21", "S72", "T14"
-    ]
-    
+    # ⚠️ 旧基层病种前缀清单 BASIC_DISEASE_GROUPS 已停用（用户 2026-09-04 裁决）：
+    # 基层病种判定一律以《分组方案》基层病种 sheet 名录（引擎）为唯一权威，
+    # 旧式序号码（如 K35-1）不再判为基层病种。
+
     def __init__(self, config: CoefficientCalculationConfig = None):
         """
         初始化选择器
-        
+
         Args:
             config: 系数计算配置
         """
         self.config = config or CoefficientCalculationConfig()
-    
+        self._nat_engine = None   # DIP3.0 国家目录引擎（延迟加载，基层病种权威判定）
+
+    def _get_nat_engine(self):
+        """延迟获取 DIP3.0 国家目录引擎（用于基层病种权威判定；缺失则返回 None）。"""
+        if self._nat_engine is not None:
+            return self._nat_engine
+        try:
+            import os
+            from .national_directory_v30 import get_national_engine
+            from ..utils.paths import get_data_dir
+        except Exception:
+            return None
+        try:
+            xlsx = os.path.join(str(get_data_dir()), "DIP3.0国家目录库.xlsx")
+            if os.path.exists(xlsx):
+                self._nat_engine = get_national_engine(xlsx)
+        except Exception:
+            self._nat_engine = None
+        return self._nat_engine
+
     def is_basic_disease_group(self, dip_code: str) -> bool:
-        """检查是否为基层病种（不区分医疗机构调节系数）"""
+        """检查是否为基层病种（不区分医疗机构调节系数，同病同治同价）。
+
+        DIP3.0 口径（用户 2026-09-04 裁决）：《分组方案》基层病种 sheet 名录为
+        唯一权威（诊断+手术对；手术为空=仅保守治疗组）。命中方案序号（如 JC-3625）
+        或 DIP 组合码（如 K35-47.0100- / I20-保守治疗-）时按引擎判定；
+        旧式序号码（如 K35-1）与引擎不可用时一律不判为基层病种
+        （旧前缀清单 BASIC_DISEASE_GROUPS 已停用）。
+        """
         if not dip_code:
             return False
-        # 提取病种编码前缀（如K35-1 -> K35）
-        prefix = dip_code.split('-')[0] if '-' in dip_code else dip_code[:3]
-        return prefix in self.BASIC_DISEASE_GROUPS
+        import re as _re
+        eng = self._get_nat_engine()
+        if eng is None:
+            return False
+        # 仅当编码呈 DIP3.0 新方案形态（方案序号 / 含「保守治疗」段 / 含 ICD 手术码）
+        # 才走引擎权威判定；旧式序号码（如 K35-1）不判为基层病种
+        looks_new = bool(
+            _re.fullmatch(r"[A-Z]{2}-\d+", dip_code.strip())
+            or "保守治疗" in dip_code
+            or _re.search(r"\d{2}\.\d{2}", dip_code)
+        )
+        if not looks_new:
+            return False
+        try:
+            if _re.fullmatch(r"[A-Z]{2}-\d+", dip_code.strip()):
+                # 方案序号（XQ/BX/FZ/JC-NN）
+                row = eng.by_seq.get(dip_code.strip())
+                if row is not None:
+                    return eng.is_grassroot(row.get("主要诊断编码", ""),
+                                            row.get("主要手术操作编码", ""))
+            elif "-" in dip_code:
+                # DIP 组合码：主诊断-主手术(-相关手术)；主手术段为「保守治疗」记空
+                parts = dip_code.split("-")
+                diag = parts[0]
+                oprn = "" if len(parts) < 2 or parts[1] in ("保守治疗", "") else parts[1]
+                return eng.is_grassroot(diag, oprn)
+        except Exception:
+            pass
+        return False
     
     def calculate_coefficient(
         self,

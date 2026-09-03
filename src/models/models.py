@@ -95,7 +95,7 @@ class DiseaseGroup:
     trim_count: int = 0            # 被裁剪剔除的极端病例数
 
     # 成组逻辑（核心病种 / 综合病种）
-    # 综合病种子组：内科诊疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组
+    # 综合病种子组：保守治疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组
     mixed_subtype: str = ""        # 综合病种子组类型（核心病种此列为空）
     op_category: str = ""          # 主手术操作类别（手术/治疗性操作/诊断性操作/介入治疗/无）
     grouping_layer: str = ""       # 成组层次（先期分组/并项规则/诊断辅助细分/基本规则/综合病种）
@@ -103,6 +103,8 @@ class DiseaseGroup:
     # 国家目录库匹配
     national_dip_code: str = ""    # 匹配到的国家目录库 DIP 编码
     national_matched: bool = False # 是否匹配国家目录库
+    national_seq: str = ""         # 命中的国家目录方案序号（如 BX-20 / JC-1858，全局唯一）
+    is_grassroot: bool = False     # 基层病种标记（同病同价，不设医疗机构调节系数）
 
     # 综合病种质量控制
     cv: float = 0.0                # 组内变异系数（标准差/均值），用于综合病种合理性校验
@@ -114,9 +116,14 @@ class DiseaseGroup:
     # 辅助分型（第三步）：对核心病种触发后拆分出的子组元数据
     auxiliary_type: str = ""       # 触发并拆分的辅助维度（严重程度/年龄特征/ICU天数/CCI）
     auxiliary_level: str = ""      # 该子组所属分型等级（如 重度/新生儿期/超长ICU/极严重）
-    auxiliary_coefficient: Decimal = Decimal("1.0")  # 辅助分型调节系数（测算拟合默认值）
+    auxiliary_coefficient: Decimal = Decimal("1.0")  # 辅助分型调节系数（数据化 mj/M）
+    auxiliary_trigger_coefficient: Decimal = Decimal("1.0")  # 触发系数（mj/M，用于多规则竞争）
     auxiliary_parent_code: str = ""  # 若为拆分出的子组，记录父核心病种代码
     auxiliary_split: bool = False  # 该核心病种是否已按辅助分型拆分
+
+    # 辅助分型范围控制（B6）：中医优势病种 / 床日病种不纳入辅助分型
+    is_tcm_advantage: bool = False  # 中医优势病种标记
+    is_bed_day: bool = False        # 床日病种标记
 
 
 @dataclass
@@ -217,6 +224,11 @@ class MedicalRecord:
     coma_hours: int = 0  # 颅脑损伤患者昏迷时间（小时） [DIP3.0规范]
     icu_type: str = ""  # 重症监护病房类型 [DIP3.0规范]
     icu_hours: int = 0  # 进出重症监护室时间（小时） [DIP3.0规范]
+
+    # 重症判断补充字段（国家未明确监护病房住院天数分型，业务以收费项目/病房类型 + 特级护理天数判断）
+    spga_nurscare_days: int = 0   # 特级护理天数 [业务补充，用于重症判断 判断1/判断2]
+    scs_cutd_ward_type: str = ""  # 重症监护病房类型 [业务补充，用于重症判断 判断2]
+    charge_item_codes: List[str] = field(default_factory=list)  # 收费项目编码集合 [业务补充，用于重症判断 判断1]
     
     # ============================================================
     # 八、费用信息 [DIP3.0规范][4101A][标准编码]

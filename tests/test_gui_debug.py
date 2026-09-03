@@ -1,11 +1,13 @@
 """
 DIP测算工具 - 图形化测试界面（带错误捕获）
 """
-import tkinter as tk
+import pytest
+tk = pytest.importorskip("tkinter")
 from tkinter import ttk, messagebox
 import sys
 import traceback
 import os
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -302,6 +304,34 @@ class DIPCalculationGUI:
                         self.detail_text.insert(tk.END, f"    {key}: {value}\n")
         
         log("Calculation complete")
+
+
+def test_debug_batch_calculation():
+    recs = generate_test_records()
+    assert len(recs) == 35
+    calc = LocalDirectoryScoreCalculator(create_default_config())
+    results = calc.batch_calculate_local_directory(recs)
+    assert set(results.keys()) == {"I21-1", "K35-1"}
+    for v in results.values():
+        assert float(v["final_score"]) > 0
+        assert float(v["hospital_coefficient"]) > 0
+
+
+def test_debug_tree_populated():
+    pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:
+        pytest.skip("no display available")
+    try:
+        app = DIPCalculationGUI(root)
+        children = app.result_tree.get_children()
+        assert len(children) == 2
+        for c in children:
+            vals = app.result_tree.item(c, "values")
+            assert float(vals[2]) > 0  # 最终分值
+    finally:
+        root.destroy()
 
 
 def main():

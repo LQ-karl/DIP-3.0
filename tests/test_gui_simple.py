@@ -1,9 +1,11 @@
 """
 DIP测算工具 - 简单测试界面
 """
-import tkinter as tk
+import pytest
+tk = pytest.importorskip("tkinter")
 from tkinter import ttk
 import sys, os
+import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
@@ -115,6 +117,44 @@ class App:
                 f"{float(drug_avg):.2f}" if drug_avg != 'N/A' else 'N/A',
                 f"{float(mat_avg):.2f}" if mat_avg != 'N/A' else 'N/A'
             ))
+
+
+def test_simple_generate_records():
+    recs = generate_test_records()
+    assert len(recs) == 35
+    assert len([r for r in recs if r.main_diag_code == "I21.0"]) == 20
+    assert len([r for r in recs if r.main_diag_code == "K35.9"]) == 15
+    for r in recs:
+        assert r.dip_disease_code
+
+
+def test_simple_batch_calculation():
+    recs = generate_test_records()
+    results = LocalDirectoryScoreCalculator(
+        create_default_config()
+    ).batch_calculate_local_directory(recs)
+    assert set(results.keys()) == {"I21-1", "K35-1"}
+    assert sum(v["total_cases"] for v in results.values()) == 35
+    for v in results.values():
+        assert float(v["final_score"]) > 0
+        assert float(v["hospital_coefficient"]) > 0
+
+
+def test_simple_gui_wires_tree():
+    pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except Exception:
+        pytest.skip("no display available")
+    try:
+        app = App(root)
+        children = app.tree.get_children()
+        assert len(children) == 2
+        for c in children:
+            vals = app.tree.item(c, "values")
+            assert float(vals[2]) > 0  # 分值列
+    finally:
+        root.destroy()
 
 
 if __name__ == "__main__":

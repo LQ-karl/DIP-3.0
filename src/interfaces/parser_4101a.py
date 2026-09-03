@@ -350,7 +350,13 @@ class Interface4101AParser:
         for fee in fee_details:
             amount = Decimal(str(fee.get("amt", 0)))
             fee_type = str(fee.get("med_chrgitm_type", ""))
-            
+
+            # 采集收费项目编码（用于业务补充的重症判断·判断1：含重症监护/层流洁净床位费）
+            fee_code = str(fee.get("med_chrgitm_codg") or fee.get("chrgitm_codg")
+                           or fee.get("fee_item_code") or "").strip()
+            if fee_code and fee_code not in record.charge_item_codes:
+                record.charge_item_codes.append(fee_code)
+
             total_cost += amount
             
             # 根据费用类别分类
