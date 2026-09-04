@@ -204,3 +204,45 @@ def test_grassroot_old_prefix_fallback_disabled():
     # 旧式序号码不再回退旧 34 前缀清单 → False
     assert selector.is_basic_disease_group('K35-1') is False
     assert selector.is_basic_disease_group('I21-1') is False
+
+
+def test_grassroot_institution_level_matching():
+    """基层机构等级匹配口径（用户 2026-09-05 裁决：前缀匹配 + 扩展）。
+
+    - 一级系列写法（一级 / 一级甲等 / 一级乙等 / 一级丙等）全部计入分子；
+    - 社区卫生服务中心 / 社区卫生服务站 / 乡镇卫生院 计入；
+    - 二级、三级甲等、空值 不计入（避免占比被高估）。
+    """
+    gen = LocalDirectoryGenerator(threshold=THRESHOLD)
+    judge = gen.is_grassroot_institution
+
+    for lv in ('一级', '一级甲等', '一级乙等', '一级丙等',
+               '社区卫生服务中心', '社区卫生服务站', '乡镇卫生院'):
+        assert judge(lv) is True, f"{lv} 应计入基层机构病例数"
+
+    for lv in ('二级', '二级甲等', '三级', '三级甲等', '三级乙等', '', '   ', None):
+        assert judge(lv) is False, f"{lv!r} 不应计入基层机构病例数"
+
+
+def test_grassroot_ratio_counts_variant_level_writings():
+    """等级写法不统一时的占比统计：一级/一级甲等/卫生服务站 均计入分子。
+
+    10 例中 6 例为基层机构（2 例「一级」+2 例「一级甲等」+1 例「社区卫生服务站」
+    +1 例「乡镇卫生院」）→ 占比 60% ≥ 50% 且 CV 低 → 应入选；若按旧精确匹配
+    仅 2 例计入（20%）则会落选，故本用例同时锁定该回归。
+    """
+    levels = (['一级'] * 2 + ['一级甲等'] * 2 + ['社区卫生服务站'] * 1
+              + ['乡镇卫生院'] * 1 + ['三级甲等'] * 4)
+    df = pd.DataFrame(_rows('A09.9', '未特指病因的胃肠炎和结肠炎',
+                            [5000 + i * 100 for i in range(10)], levels))
+    gen = LocalDirectoryGenerator(threshold=THRESHOLD)
+    groups = gen.cluster_records_to_groups(df)
+    groups = gen.select_grassroot_groups(groups)
+
+    rep = _report_of(gen, 'A09.9')
+    assert rep is not None, "A09.9 应进入基层病种遴选"
+    assert rep['基层机构病例数'] == 6, f"基层机构病例数应为 6，实际 {rep['基层机构病例数']}"
+    assert abs(rep['基层机构病例占比'] - 0.6) < 1e-6
+    assert rep['是否入选'] == '是', f"占比 60% 应入选，实际：{rep['未入选原因']}"
+    hit = [g for g in groups.values() if g.main_diag_code == 'A09.9']
+    assert hit and all(g.is_grassroot for g in hit)

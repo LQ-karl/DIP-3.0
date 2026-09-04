@@ -41,7 +41,13 @@ class LocalDirectoryGenerator:
     #   规范原文（第三章第四节）：设置基层病种是引导三级医疗机构功能归位，发挥二级
     #   医疗机构枢纽作用；遴选条件之一为「基层医疗机构病例占比较大」。
     #   此处「基层医疗机构」口径经用户 2026-09-04 确认 = 一级及以下。
-    DEFAULT_GRASSROOT_LEVELS = ("一级", "社区卫生服务中心", "乡镇卫生院")
+    #   2026-09-05 用户裁决：等级写法不统一（如「一级甲等」），改为「前缀匹配+扩展」：
+    #     - 前缀匹配：以 DEFAULT_GRASSROOT_PREFIXES 中任一项开头的等级均计入
+    #       （一级 / 一级甲等 / 一级乙等 / 一级丙等 …）
+    #     - 机构名精确匹配：社区卫生服务中心 / 社区卫生服务站 / 乡镇卫生院
+    #   目的：避免数据把一级医院写成「一级甲等」时分子漏计、占比被系统性低估。
+    DEFAULT_GRASSROOT_LEVELS = ("社区卫生服务中心", "社区卫生服务站", "乡镇卫生院")
+    DEFAULT_GRASSROOT_PREFIXES = ("一级",)
 
     @staticmethod
     def _layer_sort_key(g) -> Tuple[int, int, str]:
@@ -79,6 +85,7 @@ class LocalDirectoryGenerator:
         grassroot_min_basic_ratio: float = 0.5,
         grassroot_max_cv: float = 0.7,
         grassroot_hospital_levels: Optional[List[str]] = None,
+        grassroot_level_prefixes: Optional[List[str]] = None,
     ):
         """
         初始化本地目录库生成器
@@ -98,6 +105,7 @@ class LocalDirectoryGenerator:
             grassroot_min_basic_ratio: 基层医疗机构病例占比下限（规范"占比较大"，地方自定）
             grassroot_max_cv: 基层病种组内变异系数上限（规范示例：CV 值不超过 0.7）
             grassroot_hospital_levels: 「基层医疗机构」等级范围，默认一级及以下
+            grassroot_level_prefixes: 等级前缀匹配规则（默认「一级」→ 一级/一级甲等/一级乙等…）
         """
         self.threshold = threshold
         self.data_dir = data_dir if data_dir else str(get_data_dir())
@@ -145,6 +153,11 @@ class LocalDirectoryGenerator:
             grassroot_hospital_levels
             if grassroot_hospital_levels
             else self.DEFAULT_GRASSROOT_LEVELS
+        )
+        self.grassroot_level_prefixes = tuple(
+            grassroot_level_prefixes
+            if grassroot_level_prefixes
+            else self.DEFAULT_GRASSROOT_PREFIXES
         )
         # 遴选过程留痕（导出《基层病种遴选依据表》）
         self.grassroot_report: List[Dict] = []
@@ -1735,6 +1748,28 @@ class LocalDirectoryGenerator:
     #             ③ 医疗费用相对稳定，变异系数较低（如 CV 值不超过 0.7）。
     #   分值设定：可不设医疗机构调节系数，即采用同一分值与医疗机构结算（同病同治同价）。
     # ------------------------------------------------------------------
+    def is_grassroot_institution(self, level: str) -> bool:
+        """判定某病例所属机构是否属「基层医疗机构」（基层病种占比的分子口径）。
+
+        匹配规则（用户 2026-09-05 裁决：前缀匹配 + 扩展）：
+          1. 前缀匹配：等级以 grassroot_level_prefixes 中任一项开头
+             （如「一级」「一级甲等」「一级乙等」「一级丙等」→ 计入）；
+          2. 机构名精确匹配：社区卫生服务中心 / 社区卫生服务站 / 乡镇卫生院；
+          3. 其余（二级、三级甲等…）与空值均不计入。
+
+        Args:
+            level: 医院等级原始字符串（结算清单「医院等级/医疗机构等级」列）
+
+        Returns:
+            是否计入基层机构病例数
+        """
+        lv = str(level or '').strip()
+        if not lv:
+            return False
+        if any(lv.startswith(p) for p in self.grassroot_level_prefixes):
+            return True
+        return lv in self.grassroot_levels
+
     def select_grassroot_groups(
         self,
         groups: Dict[str, DiseaseGroup],
@@ -1769,9 +1804,10 @@ class LocalDirectoryGenerator:
 
             members = group.member_records or []
             total = len(members)
+            # 分子：基层机构病例数（2026-09-05 起用归一化判定，兼容「一级甲等」等写法）
             basic = sum(
                 1 for m in members
-                if str(m.get('hospital_level', '')).strip() in self.grassroot_levels
+                if self.is_grassroot_institution(m.get('hospital_level', ''))
             )
             ratio = (basic / total) if total else 0.0
 
@@ -2099,7 +2135,7 @@ class LocalDirectoryGenerator:
             members = group.member_records or []
             basic = sum(
                 1 for m in members
-                if str(m.get('hospital_level', '')).strip() in self.grassroot_levels
+                if self.is_grassroot_institution(m.get('hospital_level', ''))
             )
             ratio = (basic / len(members)) if members else 0.0
             costs = [Decimal(str(m.get('total_cost', 0))) for m in members]
