@@ -457,6 +457,11 @@ def test_auxiliary_typing():
     assert age.classify(rec(age=75))["sub_level"] == "70-79岁"
     assert age.classify(rec(age=85))["sub_level"] == "80岁以上"
     assert age.classify(rec(age=40)) is None, "成人(18-64)不适用年龄特征分型"
+    # B11（2026-09-04 用户裁决）：65岁以上结合严重程度辅助分型校正
+    assert age.classify(rec(age=75), severity_level="重度")["sub_level"] == "70-79岁·重度"
+    assert age.classify(rec(age=67), severity_level="轻度")["sub_level"] == "65-69岁·轻度"
+    assert age.classify(rec(age=85), severity_level="中度")["condition"].find("B11") >= 0
+    assert age.classify(rec(age=40), severity_level="重度") is None, "成人不受严重程度校正影响"
 
     # ---------- ④ ICU 天数 ----------
     icu = ICUStayClassifier()

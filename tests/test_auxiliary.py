@@ -149,10 +149,43 @@ def test_auxiliary_calculator():
     assert result['severity']['level'] == '重度'
     assert result['severity']['coefficient'] == Decimal("1.3")
     assert '老年' in result['age']['level'], f"72 岁应归老年，实际 {result['age']['level']}"
-    assert result['age']['sub_level'] == '70-79岁'
+    # B11（2026-09-04 用户裁决）：65 岁以上结合严重程度辅助分型校正——
+    # 本例 E11（糖尿病）属重度，年龄子组应进一步标注严重程度
+    assert result['age']['sub_level'] == '70-79岁·重度'
     assert result['max_coefficient'] == Decimal("1.3"), \
         f"最高调节系数应为 1.3（CCI 1.1 / 重度 1.3 / 老年 1.1 取大），实际 {result['max_coefficient']}"
     assert isinstance(result['violation'], dict), "violation 应为 dict"
+
+
+def test_elderly_severity_correction():
+    """B11：65岁以上结合疾病严重程度辅助分型校正（DIP3.0 规范表述，用户裁决实现）。
+
+    - 传入 severity_level 时，65+ 子组标签形如「70-79岁·重度」，condition 注明校正；
+    - 不传（None）时保持纯年龄分档（向后兼容）；
+    - 18-64 岁成人与儿科段不受影响。
+    """
+    classifier = AgeFeatureClassifier()
+
+    def rec(age):
+        return MedicalRecord(
+            record_id="R011", settlement_id="S011", patient_id="P011",
+            visit_id="V011", hospital_code="H001", hospital_name="测试医院",
+            main_diag_code="J18.9", main_diag_name="肺炎", age=age,
+        )
+
+    # 65+ 各年龄档 × 严重程度组合标签
+    assert classifier.classify(rec(67), severity_level="重度")['sub_level'] == '65-69岁·重度'
+    assert classifier.classify(rec(78), severity_level="中度")['sub_level'] == '70-79岁·中度'
+    assert classifier.classify(rec(88), severity_level="轻度")['sub_level'] == '80岁以上·轻度'
+    corrected = classifier.classify(rec(72), severity_level="死亡-IV-B")
+    assert corrected['sub_level'] == '70-79岁·死亡-IV-B'
+    assert 'B11' in corrected['condition'], "校正条件应注明 B11"
+
+    # 不传 severity_level → 保持纯年龄分档（向后兼容）
+    assert classifier.classify(rec(75))['sub_level'] == '70-79岁'
+
+    # 成人（18-64）不受影响：即使传了 severity_level 也不产生年龄分型
+    assert classifier.classify(rec(50), severity_level="重度") is None
 
 
 if __name__ == "__main__":
@@ -161,4 +194,5 @@ if __name__ == "__main__":
     test_age_classifier()
     test_violation_classifier()
     test_auxiliary_calculator()
+    test_elderly_severity_correction()
     print("test_auxiliary 全部通过")

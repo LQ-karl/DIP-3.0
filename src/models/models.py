@@ -234,10 +234,14 @@ class MedicalRecord:
     # 八、费用信息 [DIP3.0规范][4101A][标准编码]
     # ============================================================
     total_cost: Decimal = Decimal("0")  # 医疗总费用（金额合计） [DIP3.0规范][4101A]
-    drug_cost: Decimal = Decimal("0")  # 药品费用 [DIP3.0规范][4101A]
+    # ⚠️ B13（2026-09-04 用户裁决）：drug_cost / treatment_cost 的数据语义
+    # **待数据源核实**——尚未确认其与 DIP3.0 规范「药品费」「治疗费（不含手术费）」
+    # 字段定义是否一致。二者参与严重程度分型的高费用判定（治疗费占比/药品费占比
+    # ≥50%），若实际口径不同（如含手术费）需先修正数据源映射再测算。
+    drug_cost: Decimal = Decimal("0")  # 药品费用 [DIP3.0规范][4101A]（B13：语义待数据源核实）
     consumable_cost: Decimal = Decimal("0")  # 耗材费用 [DIP3.0规范][4101A]
     exam_cost: Decimal = Decimal("0")  # 检查费用 [DIP3.0规范][4101A]
-    treatment_cost: Decimal = Decimal("0")  # 治疗费用 [DIP3.0规范][4101A]
+    treatment_cost: Decimal = Decimal("0")  # 治疗费用 [DIP3.0规范][4101A]（B13：语义待数据源核实，应=治疗费不含手术费）
     material_cost: Decimal = Decimal("0")  # 材料费用 [DIP3.0规范][4101A]
     nursing_cost: Decimal = Decimal("0")  # 护理费用 [DIP3.0规范][4101A]
     

@@ -437,12 +437,20 @@ class DiseaseSeverityClassifier:
 class AgeFeatureClassifier:
     """年龄特征分型分类器"""
     
-    def classify(self, record: MedicalRecord) -> Optional[Dict]:
+    def classify(self, record: MedicalRecord,
+                 severity_level: Optional[str] = None) -> Optional[Dict]:
         """
         年龄特征分型
 
+        B11（2026-09-04 用户裁决实现）：规范「65岁以上利用疾病严重程度辅助分型
+        进行校正」——65 岁以上病例的年龄子组结合严重程度字典（重度/中度/轻度等）
+        进一步区分，子组标签形如「70-79岁·重度」，各组合子型分别统计触发系数
+        （mj/M 数据化）；18-64 岁成人与儿科段不受影响。
+
         Args:
             record: 住院病例记录
+            severity_level: 该病例的疾病严重程度等级（重度/中度/轻度等）；
+                仅对 65 岁以上病例生效，None 时保持纯年龄分档。
 
         Returns:
             分型结果（如不适用返回None）
@@ -452,7 +460,7 @@ class AgeFeatureClassifier:
         if age < 18:
             return self._classify_pediatric(age, getattr(record, 'day_age', 0))
         elif age >= 65:
-            return self._classify_elderly(age)
+            return self._classify_elderly(age, severity_level=severity_level)
 
         return None
 
@@ -488,21 +496,31 @@ class AgeFeatureClassifier:
                 "condition": f"年龄={age}岁"
             }
 
-    def _classify_elderly(self, age: int) -> Dict:
-        """老年年龄分型（DIP3.0：65岁以上）"""
+    def _classify_elderly(self, age: int,
+                          severity_level: Optional[str] = None) -> Dict:
+        """老年年龄分型（DIP3.0：65岁以上）。
+
+        B11：severity_level 非空时（规范「65岁以上利用疾病严重程度辅助分型
+        进行校正」），子组标签结合严重程度进一步区分（如「70-79岁·重度」）；
+        调节系数仍由主流程按子组 mj/M 数据化计算，此处系数为分档基准值。
+        """
         if age < 70:
             sub, coeff = "65-69岁", Decimal("1.05")
         elif age < 80:
             sub, coeff = "70-79岁", Decimal("1.1")
         else:
             sub, coeff = "80岁以上", Decimal("1.2")
-        return {
+        result = {
             "type": "年龄特征",
             "level": "老年",
             "sub_level": sub,
             "coefficient": coeff,
             "condition": f"年龄={age}岁"
         }
+        if severity_level:
+            result["sub_level"] = f"{sub}·{severity_level}"
+            result["condition"] = f"年龄={age}岁，严重程度={severity_level}（B11 校正）"
+        return result
 
 
 class ICUStayClassifier:
@@ -850,7 +868,11 @@ class AuxiliaryDirectoryCalculator:
             results["severity"] = self.severity_classifier.classify_non_malignant(record)
         
         # 3. 年龄特征分型
-        results["age"] = self.age_classifier.classify(record)
+        # B11：65岁以上结合疾病严重程度辅助分型校正（步骤2已算得 severity）
+        severity_level = results["severity"]["level"] if results["severity"] else None
+        results["age"] = self.age_classifier.classify(
+            record, severity_level=severity_level
+        )
         
         # 4. ICU天数分型（需要从其他数据获取ICU天数）
         icu_days = getattr(record, 'icu_days', 0)
@@ -963,6 +985,9 @@ class AuxiliaryDirectoryCalculator:
     #      而非逐病例一条。
     #   2. 触发条件（§5.2 三条，全部量化）：
     #      (1) 病种病例数 > AUX_MIN_CORE_CASES（上年度病例数超一定例数）；
+    #          ⚠️ 口径注明（B14，2026-09-04）：本地测算以**本年度成组病例数**代理
+    #          "上年度病例数"（本地数据无上年度维度）；如地方可获得真实上年度
+    #          病例数，应替换为上年度口径后再评估触发。
     #      (2) 某分型评估病例数 > AUX_MIN_SUBTYPE_CASES（参与分型评估病例数超一定例数）；
     #      (3) 组内费用变异系数偏大（cv_before >= AUX_CV_BEFORE_THRESHOLD，规范术语建议
     #          遴选 CV>0.7 的病种引入辅助分型），且经某维度分型后组内费用 CV 下降明显
@@ -1063,7 +1088,7 @@ class AuxiliaryDirectoryCalculator:
         dim_defs = {
             "CCI": self._label_cci,
             "疾病严重程度": lambda r: self._label_severity(r, disease_mean),
-            "年龄特征": self._label_age,
+            "年龄特征": lambda r: self._label_age(r, disease_mean),
             "重症监护": self._label_icu,
         }
 
@@ -1208,8 +1233,18 @@ class AuxiliaryDirectoryCalculator:
             res = self.severity_classifier.classify_non_malignant(rec)
         return res["level"]
 
-    def _label_age(self, rec: MedicalRecord) -> str:
-        res = self.age_classifier.classify(rec)
+    def _label_age(self, rec: MedicalRecord,
+                   disease_mean: Optional[Decimal] = None) -> str:
+        """年龄维度子型标签。B11：65岁以上结合严重程度字典进一步区分
+        （标签形如「老年(70-79岁·重度)」），重度/中度/轻度分别成桶统计触发系数。"""
+        severity_level = None
+        if rec.age >= 65:
+            # B11：复用严重程度分型逻辑取等级（肿瘤需 disease_mean 定高费用，
+            # 缺省传 0 时高费用分支自然跳过，仍可判死亡/转移/衰竭/病损/其他）
+            severity_level = self._label_severity(
+                rec, disease_mean if disease_mean is not None else Decimal("0")
+            )
+        res = self.age_classifier.classify(rec, severity_level=severity_level)
         if res is None:
             return "基准(无)"
         sub = res.get("sub_level")

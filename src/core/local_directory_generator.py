@@ -1367,6 +1367,8 @@ class LocalDirectoryGenerator:
             （即该核心病种成组后的 group.avg_cost，记为 mi）。本地目录测算不
             计算真实点值，故分值费用标准直接取 mi，而非任意平均费用倍数。
         B6 范围控制：中医优势病种 / 床日病种不纳入辅助分型（标记或码集命中即跳过）。
+        B11 严重程度校正：65 岁以上病例的年龄子组结合疾病严重程度字典进一步
+            区分（子组标签形如「70-79岁·重度」），各组合子型分别统计触发系数。
 
         参数说明：
           - cv_mode="absolute"：当前测试阶段默认，与 Web 门控口径一致
@@ -1536,7 +1538,10 @@ class LocalDirectoryGenerator:
             self._bucket(dims['严重程度'], sev['level'], sev['coefficient'], m)
 
             # 年龄特征
-            age_cls = age_calc.classify(rec)
+            # B11（2026-09-04 用户裁决）：规范「65岁以上利用疾病严重程度辅助分型
+            # 进行校正」——65+ 年龄子组结合严重程度字典进一步区分（子组标签形如
+            # 「70-79岁·重度」），重度/中度/轻度分别成桶、分别统计触发系数 mj/M。
+            age_cls = age_calc.classify(rec, severity_level=sev['level'])
             if age_cls:
                 self._bucket(dims['年龄特征'], age_cls['sub_level'],
                              age_cls['coefficient'], m)
