@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """由《DIP 3.0 版分组方案》PDF 构建国家目录库 xlsx。
 
+⚠️ 已由 PDF 抽取方案退役（2026-09-12）：
+    PDF 版面抽取存在数据缺陷（编码丢小数点、相邻编码粘连、整行丢失），已确认共
+    丢失/损坏 78 条记录。现行权威构建脚本改为
+    `scripts/build_dip30_national_directory_from_xlsx.py`（直接读取官方 xlsx）。
+    本脚本仅保留作历史追溯，请勿再用它重建目录库；
+    一致性核验请用 `scripts/verify_national_directory.py`。
+
 用法:
     python scripts/build_dip30_national_directory.py [--pdf 路径] [--out 路径] [--no-backup]
 

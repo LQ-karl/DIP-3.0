@@ -26,3 +26,5 @@ data/*.docx
 /dip3_spec_text.txt
 # 目录库征求意见稿备份快照（旧版内容已由 git 历史保存）
 data/DIP3.0国家目录库_征求意见稿备份_*.xlsx
+# 目录库 PDF 抽取版备份快照（2026-09-12 起改由官方 xlsx 重建，旧版已由 git 历史保存）
+data/DIP3.0国家目录库_PDF抽取版备份_*.xlsx
