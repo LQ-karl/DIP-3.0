@@ -980,12 +980,20 @@ def page_dictionary():
     }
     
     try:
-        df = pd.read_excel(dict_file_map[dict_name])
+        dict_path = dict_file_map[dict_name]
+        # 多 sheet 字典（如国家目录库）：支持切换工作表；单 sheet 字典自动隐藏选择器
+        sheet_names = pd.ExcelFile(dict_path).sheet_names
+        if len(sheet_names) > 1:
+            sheet_name = st.selectbox("选择工作表", sheet_names)
+        else:
+            sheet_name = sheet_names[0] if sheet_names else 0
+        df = pd.read_excel(dict_path, sheet_name=sheet_name)
         
         col1, col2 = st.columns([3, 1])
         
         with col1:
-            st.subheader(f"{dict_name} ({len(df)} 条记录)")
+            _dict_title = f"{dict_name} · {sheet_name}" if len(sheet_names) > 1 else dict_name
+            st.subheader(f"{_dict_title} ({len(df)} 条记录)")
             
             # 搜索功能
             search_term = st.text_input("搜索", "")

@@ -182,6 +182,66 @@ def test_web_grassroot_selection_flow():
     assert sum(g.case_count for g in grass) == 18
 
 
+def test_web_dictionary_sheet_selector():
+    """Web 字典查看页：国家目录库支持切换工作表，「不纳入分组」两个清单可见。
+
+    修复前 `pd.read_excel(path)` 未指定 sheet，只显示第一个 sheet（核心病种），
+    另 4 个 sheet（不纳入分组_主要诊断 4742 / 不纳入分组_主要手术操作 4111 /
+    基层病种 127 / 结核耐药诊断列表 48）在界面上不可见。
+    """
+    at = AppTest.from_file(APP, default_timeout=120)
+    at.run()
+
+    nav = _by_label(at.radio, "导航菜单")
+    nav.set_value("📚 字典查看")
+    at.run()
+    assert not at.exception, f"字典页抛出异常: {at.exception}"
+
+    # 默认字典 = DIP3.0国家目录库
+    dict_sel = _by_label(at.selectbox, "选择字典")
+    assert dict_sel.value == "DIP3.0国家目录库"
+
+    # 多 sheet 才会出现「选择工作表」；两个排除清单必须在选项中
+    sheet_sel = _by_label(at.selectbox, "选择工作表")
+    assert sheet_sel.value == "核心病种"
+    for s in ["不纳入分组_主要诊断", "不纳入分组_主要手术操作", "基层病种", "结核耐药诊断列表"]:
+        assert s in sheet_sel.options, f"工作表选择器缺少 {s}"
+
+    # 切到「不纳入分组_主要诊断」→ 4742 条
+    sheet_sel.set_value("不纳入分组_主要诊断")
+    at.run()
+    assert not at.exception, f"切换工作表抛出异常: {at.exception}"
+    subs = [s.value for s in at.subheader if "不纳入分组_主要诊断" in s.value]
+    assert subs, f"未渲染工作表标题，现有: {[s.value for s in at.subheader]}"
+    assert "4742" in subs[0], f"记录数不符: {subs[0]}"
+
+    # 切到「不纳入分组_主要手术操作」→ 4111 条
+    _by_label(at.selectbox, "选择工作表").set_value("不纳入分组_主要手术操作")
+    at.run()
+    assert not at.exception
+    subs2 = [s.value for s in at.subheader if "不纳入分组_主要手术操作" in s.value]
+    assert subs2, f"未渲染工作表标题，现有: {[s.value for s in at.subheader]}"
+    assert "4111" in subs2[0], f"记录数不符: {subs2[0]}"
+
+
+def test_web_dictionary_single_sheet_hides_selector():
+    """单 sheet 字典（低标目录）不出现「选择工作表」，标题不含 sheet 后缀。"""
+    at = AppTest.from_file(APP, default_timeout=120)
+    at.run()
+
+    _by_label(at.radio, "导航菜单").set_value("📚 字典查看")
+    at.run()
+
+    _by_label(at.selectbox, "选择字典").set_value("低标目录")
+    at.run()
+    assert not at.exception, f"切换字典抛出异常: {at.exception}"
+    labels = [s.label for s in at.selectbox]
+    assert "选择工作表" not in labels, f"单 sheet 字典不应出现工作表选择器: {labels}"
+    subs = [s.value for s in at.subheader if s.value.startswith("低标目录")]
+    assert subs, f"未渲染标题，现有: {[s.value for s in at.subheader]}"
+    assert "·" not in subs[0], f"单 sheet 标题不应带 sheet 后缀: {subs[0]}"
+
+
 if __name__ == "__main__":
     test_web_app_renders()
     test_web_app_auxiliary_typing_flow()
