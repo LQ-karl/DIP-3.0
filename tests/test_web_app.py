@@ -242,6 +242,30 @@ def test_web_dictionary_single_sheet_hides_selector():
     assert "·" not in subs[0], f"单 sheet 标题不应带 sheet 后缀: {subs[0]}"
 
 
+def test_web_dictionary_includes_zonghe_dict():
+    """字典下拉应包含 2026-09-14 新纳入的《综合病种字典表》，且能读取全部 sheet。"""
+    at = AppTest.from_file(APP, default_timeout=120)
+    at.run()
+
+    _by_label(at.radio, "导航菜单").set_value("📚 字典查看")
+    at.run()
+
+    options = _by_label(at.selectbox, "选择字典").options
+    assert "综合病种字典表" in options, f"字典下拉缺少综合病种字典表: {options}"
+
+    _by_label(at.selectbox, "选择字典").set_value("综合病种字典表")
+    at.run()
+    assert not at.exception, f"切换字典抛出异常: {at.exception}"
+
+    subs = [s.value for s in at.subheader if s.value.startswith("综合病种字典表")]
+    assert subs, f"未渲染标题，现有: {[s.value for s in at.subheader]}"
+    assert "8192" in subs[0], f"记录数不符（应 2048 类目 × 4 组 = 8192）: {subs[0]}"
+
+    sheet_sel = _by_label(at.selectbox, "选择工作表")
+    assert set(sheet_sel.options) >= {"综合病种字典表", "分组统计"}, \
+        f"工作表选项不符: {sheet_sel.options}"
+
+
 if __name__ == "__main__":
     test_web_app_renders()
     test_web_app_auxiliary_typing_flow()

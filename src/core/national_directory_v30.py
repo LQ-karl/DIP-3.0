@@ -229,6 +229,24 @@ class NationalMatch:
         return f"NAT|{self.seq}"
 
 
+@dataclass
+class ZongheMatch:
+    """综合病种兜底匹配结果（核心病种未命中时按 主诊断类目 + 治疗方式组）。
+
+    依据：DIP 2.0 技术规范 第二章第二节「三、形成综合病种」+ 第四章第四节
+    「（二）入组综合病种」——未入核心病种的病例，以主要手术操作类型为入组依据，
+    叠加主诊断 ICD-10 类目（前三位），形成 4 类综合病种组。
+    """
+    code: str          # 综合病种编码，如 A09-1
+    name: str          # 综合病种名称，如「胃肠炎和结肠炎（内科诊疗组）」
+    icd_class: str     # 命中的 ICD-10 分类码（类目级，含 +/* 标记时保留）
+    group_no: int      # 1 内科诊疗组 / 2 诊断性操作组 / 3 治疗性操作组 / 4 相关手术组
+    group_name: str    # 组名称
+
+    def group_key(self) -> str:
+        return self.code
+
+
 class NationalDirectoryV30:
     """《DIP 3.0 版分组方案》国家目录引擎。"""
 
@@ -237,6 +255,23 @@ class NationalDirectoryV30:
     SHEET_EXCL_OPRN = "不纳入分组_主要手术操作"
     SHEET_GRASSROOT = "基层病种"
     SHEET_TB_DR = "结核耐药诊断列表"
+
+    # 综合病种字典（官方兜底层；与目录库同目录的独立文件）
+    ZH_FILE = "综合病种字典表.xlsx"
+    ZH_SHEET = "综合病种字典表"
+    LAYER_ZH = "综合病种"
+
+    # 治疗方式组判定（DIP 2.0 技术规范 第四章第四节「入组综合病种」）：
+    #   主要操作 = 手术 / 介入操作      → 相关手术组(4)
+    #   主要操作 = 治疗性操作            → 治疗性操作组(3)
+    #   主要操作 = 诊断性操作            → 诊断性操作组(2)
+    #   无手术操作 / 均不能入组          → 内科诊疗组(1)
+    ZH_GROUP_BY_OP_CATEGORY = {
+        "诊断性操作": 2,
+        "治疗性操作": 3,
+        "手术": 4,
+        "介入治疗": 4,
+    }
 
     def __init__(self, path: str):
         self.path = str(path)
@@ -310,7 +345,100 @@ class NationalDirectoryV30:
         except Exception:
             self.tb_dr_codes = set()
 
+        # ---- 综合病种字典（官方兜底层，2026-09-14 用户裁决纳入） ----
+        self._load_zonghe()
+
         self._build_indexes()
+
+    def _load_zonghe(self) -> None:
+        """加载《综合病种字典表.xlsx》： (ICD-10 分类码, 组编号) -> (编码, 名称, 组名称)。
+
+        文件与目录库同目录；缺失时静默跳过（综合病种兜底层不生效，回落旧基本规则键）。
+        """
+        self.zh_index: Dict[Tuple[str, int], Tuple[str, str, str]] = {}
+        self.zh_groups: Dict[int, str] = {}
+        path = os.path.join(os.path.dirname(self.path), self.ZH_FILE)
+        if not os.path.exists(path):
+            return
+        try:
+            df = pd.read_excel(path, sheet_name=self.ZH_SHEET, dtype=str, keep_default_na=False)
+        except Exception:
+            return
+        for _, r in df.iterrows():
+            code = _clean(r.get("综合病种编码"))
+            cls = _clean(r.get("ICD-10分类码")).upper()
+            gno_raw = _clean(r.get("组编号"))
+            if not code or not cls or not gno_raw:
+                continue
+            try:
+                gno = int(float(gno_raw))
+            except (TypeError, ValueError):
+                continue
+            self.zh_index[(cls, gno)] = (
+                code, _clean(r.get("综合病种名称")), _clean(r.get("组名称")),
+            )
+            self.zh_groups[gno] = _clean(r.get("组名称"))
+
+    # ------------------------------------------------------------------
+    # 综合病种兜底（核心病种未命中时）
+    # ------------------------------------------------------------------
+    @classmethod
+    def zonghe_group_no(cls, op_category: str, has_main_oprn: bool) -> int:
+        """由主要手术操作属性判定治疗方式组编号（见类常量注释）。"""
+        if not has_main_oprn:
+            return 1
+        return cls.ZH_GROUP_BY_OP_CATEGORY.get(_clean(op_category), 1)
+
+    @staticmethod
+    def zonghe_class_candidates(main_diag: str) -> List[str]:
+        """主诊断 -> 综合病种 ICD-10 分类码候选（按精确度排序）。
+
+        字典的分类码为类目级（前三位），其中 84 个带 ICD-10 剑号「+」/星号「*」标记
+        （如 A17+ / G01*）。此处据病例诊断码中的标记优先命中带标记的类目，
+        再回落不带标记的类目。
+        """
+        c = _clean(main_diag).upper().replace(" ", "")
+        if not c:
+            return []
+        base = _icd3(c)
+        if not base:
+            return []
+        cands: List[str] = []
+        if "+" in c:
+            cands.append(base + "+")
+        if "*" in c:
+            cands.append(base + "*")
+        cands.append(base)
+        cands.append(base + "*")
+        cands.append(base + "+")
+        seen: Set[str] = set()
+        out: List[str] = []
+        for k in cands:
+            if k and k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
+
+    def match_zonghe(self, main_diag: str, op_category: str = "",
+                     has_main_oprn: bool = False) -> Optional[ZongheMatch]:
+        """综合病种兜底匹配：主诊断类目 + 治疗方式组 -> 官方综合病种编码。
+
+        Args:
+            main_diag:     主要诊断编码（病例侧）
+            op_category:   主要手术操作属性（手术/治疗性操作/诊断性操作/介入治疗/''）
+            has_main_oprn: 是否存在主要手术操作（清洗后）
+        """
+        if not getattr(self, "zh_index", None):
+            return None
+        gno = self.zonghe_group_no(op_category, has_main_oprn)
+        for cand in self.zonghe_class_candidates(main_diag):
+            hit = self.zh_index.get((cand, gno))
+            if hit is not None:
+                return ZongheMatch(
+                    code=hit[0], name=hit[1], icd_class=cand,
+                    group_no=gno, group_name=hit[2] or self.zh_groups.get(gno, ""),
+                )
+        return None
 
     def _build_indexes(self) -> None:
         # ① 先期分组

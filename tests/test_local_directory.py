@@ -277,6 +277,54 @@ def test_comprehensive_disease_subtypes():
     assert all(not g.excluded for g in mixed), "默认 exclude_below_threshold=False 不应剔除综合病种"
 
 
+def test_zonghe_dictionary_engine_fallback():
+    """综合病种兜底层：核心病种四层未命中 → 官方《综合病种字典表》按「类目 + 治疗方式组」入组。
+
+    2026-09-14 用户裁决「纳入并接入引擎兜底成组」。依据 DIP 2.0 技术规范
+    第二章第二节「形成综合病种」+ 第四章第四节「入组综合病种」：
+      ① 字典规模 = 2048 个 ICD-10 类目 × 4 组 = 8192 条；
+      ② 治疗方式组判定：无手术操作→内科诊疗组(1)；诊断性操作→(2)；
+         治疗性操作→(3)；手术 / 介入治疗→相关手术组(4)；
+      ③ 编码 = 类目码 + '-' + 组编号；名称 / 组名称一律取自字典；
+      ④ 剑号「+」/星号「*」类目优先命中带标记写法；
+      ⑤ 类目不在字典内 → 返回 None（由调用方回落 ④ 基本规则键）。
+    """
+    from src.core.national_directory_v30 import get_national_engine
+    from src.utils.paths import get_data_dir
+
+    engine = get_national_engine(str(get_data_dir() / "DIP3.0国家目录库.xlsx"))
+
+    # ① 字典规模：2048 类目 × 4 组
+    assert len(engine.zh_index) == 8192, f"综合病种索引应 8192 条，实际 {len(engine.zh_index)}"
+    assert engine.zh_groups == {1: "内科诊疗组", 2: "诊断性操作组",
+                                3: "治疗性操作组", 4: "相关手术组"}
+
+    # ② 一码四组：治疗方式组由主要手术操作属性判定
+    assert engine.match_zonghe("A09.900", "", False).code == "A09-1"
+    assert engine.match_zonghe("A09.900", "诊断性操作", True).code == "A09-2"
+    assert engine.match_zonghe("A09.900", "治疗性操作", True).code == "A09-3"
+    for cat in ("手术", "介入治疗"):
+        m = engine.match_zonghe("A09.900", cat, True)
+        assert m.code == "A09-4" and m.group_no == 4, f"{cat} 应并入相关手术组"
+    # 有主手术但类别未知（不在手术操作分类表）→ 保守治疗，落内科诊疗组
+    assert engine.match_zonghe("A09.900", "", True).code == "A09-1"
+
+    # ③ 名称 / 组名称 / 命中类目取自字典
+    m = engine.match_zonghe("A09.900", "手术", True)
+    assert m.name == "其他传染性和未特指病因的胃肠炎和结肠炎（相关手术组）"
+    assert m.group_name == "相关手术组"
+    assert m.icd_class == "A09"
+
+    # ④ 剑号 / 星号类目：优先命中带标记写法
+    assert engine.match_zonghe("A17.000", "", False).code == "A17+-1"
+    assert engine.match_zonghe("A17.000", "手术", True).code == "A17+-4"
+    assert engine.match_zonghe("G01*", "", False).code == "G01*-1"
+
+    # ⑤ 非字典内类目 / 空主诊断 → 不匹配（调用方回落 ④ 基本规则键）
+    assert engine.match_zonghe("QQQ.9", "", False) is None
+    assert engine.match_zonghe("", "", False) is None
+
+
 def test_resolve_category_name_prefers_icd10_map():
     """综合病种类目名称优先使用 ICD-10 医保2.0 版权威类目名称。
 
@@ -309,8 +357,8 @@ def test_core_disease_priority_and_merge():
          器官移植(55.6901肾移植)→XQ-6 / 呼吸循环支持(96.7201有创呼吸机≥96h)→XQ-14，
          均直出先期方案序号；对照：角膜移植(11.6000)按不纳入手术规则
          「按保守治疗入组」→JC-2975(H16.0-保守治疗-)，不进先期；
-         冠脉旁路(36.1200)国家目录无对应行→回落内置种子规则键；对照：足月
-         正常体重新生儿不进先期→JC-4513(P59.9-保守治疗-)；
+             冠脉旁路(36.1200)国家目录无对应行→综合病种兜底(I25-4 相关手术组)；
+             对照：足月正常体重新生儿不进先期→JC-4513(P59.9-保守治疗-)；
       ② 并项规则（按 BX 名录查表）：D18.0 两条规范并项术式(21.0300x003/21.0300x004)
          并为同组 BX-332；I20.0/I20.1+36.0700 诊断3位并项为同组 BX-609；
          I70.1 肾动脉支架(主)+球囊(相关) 并项为 BX-720；
@@ -334,7 +382,7 @@ def test_core_disease_priority_and_merge():
     add("N18.5", "55.6901")                 # ① 器官移植(肾) → XQ-6
     add("A41.9", "96.7201")                 # ① 呼吸循环支持(有创呼吸机≥96h) → XQ-14
     add("H16.0", "11.6000", n=3)            # 对照: 角膜移植 → 不纳入手术(按保守治疗入组)→JC-2975
-    add("I25.1", "36.1200", n=3)            # 对照: 冠脉旁路(国家目录无行→种子回落)
+    add("I25.1", "36.1200", n=3)            # 对照: 冠脉旁路(国家目录无行→综合病种兜底 相关手术组)
     # ② 并项（BX 名录查表）
     add("D18.0", "21.0300x003", n=3)        # D18.0 规范并项术式1
     add("D18.0", "21.0300x004", n=3)        # D18.0 规范并项术式2 → 与术式1同组 BX-332
@@ -360,8 +408,11 @@ def test_core_disease_priority_and_merge():
     # 角膜移植不进先期，且按不纳入手术规则「按保守治疗入组」→ H16.0-保守治疗-
     assert "JC-2975" in keys and groups["JC-2975"].grouping_layer == "基本规则", \
         f"角膜移植(11.6000)应按保守治疗入组 JC-2975，实际 {sorted(k for k in keys if 'H16' in k)}"
-    # 冠脉旁路 国家目录无对应行 → 回落内置种子规则键
-    assert "I25|36.1200|" in keys, "冠脉旁路应回落种子规则键"
+    # 冠脉旁路 国家目录无对应行 → 综合病种兜底（36.1200=手术 → 相关手术组）
+    assert "I25-4" in keys, f"冠脉旁路应落综合病种相关手术组，实际 {sorted(keys)}"
+    assert groups["I25-4"].grouping_layer == "综合病种"
+    assert groups["I25-4"].national_matched is True
+    assert groups["I25-4"].national_dip_code == "I25-4"
     # 正常体重新生儿(P59.9, 3200g) 不进先期 → JC-4513(P59.9-保守治疗-)
     assert "JC-4513" in keys, "正常体重新生儿应走基本规则保守治疗组"
 
@@ -582,7 +633,8 @@ def test_diagnostic_auxiliary_subdivision():
     """核心病种第三层·诊断辅助细分（③成组层，DIP3.0 新目录引擎版）：与第三步辅助分型严格区分。
 
     引擎自动加载 data/DIP3.0国家目录库.xlsx 后，③ 由国家目录 FZ 行直出方案序号；
-    引擎未命中（国家目录无对应行）时回落 ④ 基本规则键（引擎唯一权威，无种子回落）。
+    引擎未命中（国家目录无对应行）时回落 **综合病种兜底**（2026-09-14 用户裁决：
+    按《综合病种字典表》以「主诊断类目 + 治疗方式组」入组），再兜底 ④ 基本规则键。
     验证与第三步「触发式辅助分型」(严重程度/年龄/ICU/CCI，不产成组键) 机制不同：
       (A) 肿瘤放化疗靶向免疫：主诊断 Z51.1/Z51.8 + 其他诊断 C 范围
           × 手术组合（目录行以 + 表示 AND：99.2503 / 99.2503+99.2800x006 / 三联）
@@ -592,8 +644,8 @@ def test_diagnostic_auxiliary_subdivision():
           → FZ-1836(耐药)/FZ-1837(非耐药)/FZ-1840(A17耐药)/FZ-1829(胸廓成形)；
       (C) 烧伤类：主诊断 T20-T25 二度/三度部位码 + 其他诊断 T31/T32 面积档
           × 手术（保守/切痫86.22族/植皮86.6族）→ FZ-1745/1746/1747/1764；
-          T30(未特指)不在目录烧伤行主诊断内 → 引擎未命中回落 ④ 基本规则（T30||）；
-          一度(T30.100)《目录》无对应组 → 基本规则。
+          T30(未特指)不在目录烧伤行主诊断内 → 引擎未命中回落综合病种（T30-1 内科诊疗组）；
+          一度(T30.100)《目录》无对应组 → 同落综合病种 T30-1。
     非肿瘤非结核非烧伤病种不进入 ③（K35.9→JC-3625 基本规则）。
     肿瘤其他诊断范围收窄为 C00-C95 允许范围，C97/D 类不再触发肿瘤细分。
     """
@@ -633,7 +685,7 @@ def test_diagnostic_auxiliary_subdivision():
     add("T21.2", op="86.6201", reldx="T31.0")                               # 二度 <10% 植皮 → FZ-1747
     add("T21.3", reldx="T31.4")                                             # 三度 30-49% 保守 → FZ-1764
     # (C-回落) T30.2 / T30.100：新目录烧伤行不含 T30（未特指/一度）→ 引擎未命中
-    #          → ④ 基本规则（诊断4位键 T30||，2 例同组；旧《函》5025 种子编码已废弃）
+    #          → 综合病种兜底（无手术操作 → T30-1 内科诊疗组，2 例同组）
     add("T30.2", reldx="T31.1", **{"年龄": 35})
     # (C-一度负例) T30.100 = 一度烧伤（目录无对应组）→ 不进入诊断辅助细分 → 基本规则
     add("T30.100", reldx="T31.1", **{"年龄": 40})
@@ -658,10 +710,14 @@ def test_diagnostic_auxiliary_subdivision():
     # (A-降级) 无治疗操作 → 主手术为空记保守治疗 → JC-5111(Z51.1-保守治疗-)
     assert "JC-5111" in keys and groups["JC-5111"].grouping_layer == "基本规则", \
         "Z51.1 无治疗操作应按保守治疗入 JC-5111"
-    # (A-负例) C97 / D18 已收窄出肿瘤范围 → 走基本规则(Z51 开头)
+    # (A-负例) C97 / D18 已收窄出肿瘤范围 → 引擎未命中 → 综合病种兜底
+    #          （Z51 类目 + 99.2503 治疗性操作 → Z51-3 治疗性操作组，2 例同组）
     assert not any(k.startswith("AUX|TUMOR|C97") for k in keys)
     assert not any(k.startswith("AUX|TUMOR|D18") for k in keys)
-    assert any(k.startswith("Z51|") for k in keys), "收窄后 Z51.1+C97/D18 应走基本规则"
+    assert "Z51-3" in keys and groups["Z51-3"].grouping_layer == "综合病种", \
+        f"收窄后 Z51.1+C97/D18 应落综合病种 Z51-3，实际 {sorted(keys)}"
+    assert groups["Z51-3"].case_count == 2, \
+        f"C97 与 D18 两例应同落 Z51-3(2例)，实际 {groups['Z51-3'].case_count}"
     # (B) 结核：方案序号直出；两条耐药路径并入同组 FZ-1836(2例)
     assert "FZ-1837" in keys, "A15.1 非耐药应落 FZ-1837"
     assert "FZ-1836" in keys, "A16+U84.300 耐药应落 FZ-1836"
@@ -674,12 +730,13 @@ def test_diagnostic_auxiliary_subdivision():
         assert seq in keys, f"烧伤应直出 {seq}，实际 {sorted(keys)}"
         assert getattr(groups[seq], "national_matched", False) is True
         assert getattr(groups[seq], "grouping_layer", "") == "诊断辅助细分"
-    # (C-回落) T30.2(35岁) 与 T30.100(40岁) 均落 ④ 基本规则同键 T30||（2 例）
-    assert groups["T30||"].case_count == 2, \
-        f"T30.2 与 T30.100 应同落基本规则键 T30||(2例)，实际 {groups.get('T30||') and groups['T30||'].case_count}"
-    assert groups["T30||"].grouping_layer == "基本规则"
-    # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分
-    assert any(k.startswith("T31|") for k in keys), "T31 主诊断应走基本规则"
+    # (C-回落) T30.2(35岁) 与 T30.100(40岁) 无手术操作 → 综合病种 T30-1 内科诊疗组（2 例）
+    assert "T30-1" in keys and groups["T30-1"].case_count == 2, \
+        f"T30.2 与 T30.100 应同落综合病种 T30-1(2例)，实际 {sorted(keys)}"
+    assert groups["T30-1"].grouping_layer == "综合病种"
+    # (C-负例) T31 主诊断(仅面积无深度) 不触发烧伤细分 → 综合病种 T31-1
+    assert "T31-1" in keys and groups["T31-1"].grouping_layer == "综合病种", \
+        f"T31 主诊断应走综合病种兜底，实际 {sorted(keys)}"
 
     # ③ 与基本规则互不干扰：对照组 K35 走基本规则，不在 ③
     assert "JC-3625" in keys and groups["JC-3625"].grouping_layer == "基本规则"
@@ -695,7 +752,7 @@ def test_national_dip_alignment():
       ③ 肿瘤：Z51.1/Z51.8 × C范围 × 手术组合 → FZ-1774/FZ-1793/FZ-1806/FZ-1802；
       ③ 结核：FZ-1837(非耐药)/FZ-1836(耐药,双路径同组)/FZ-1840(A17)/FZ-1829(胸廓成形)；
       ③ 烧伤：T21.2+T31.0 → FZ-1745（目录烧伤行主诊断=T20-T25 部位码）。
-    引擎未命中时回落 ④ 基本规则键（引擎唯一权威）。
+    引擎未命中时回落综合病种兜底（主诊断类目 + 治疗方式组），再兜底 ④ 基本规则键。
     """
     rows = []
 

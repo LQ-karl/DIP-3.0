@@ -966,7 +966,8 @@ def page_dictionary():
     # 字典选择
     dict_name = st.selectbox(
         "选择字典",
-        ["DIP3.0国家目录库", "低标目录", "ICD-10编码", "ICD-9-CM-3编码", "CCI合并症并发症", "疾病严重程度辅助目录"]
+        ["DIP3.0国家目录库", "低标目录", "ICD-10编码", "ICD-9-CM-3编码",
+         "CCI合并症并发症", "疾病严重程度辅助目录", "综合病种字典表"]
     )
     
     # 加载数据
@@ -976,7 +977,8 @@ def page_dictionary():
         "ICD-10编码": str(get_data_dir() / "ICD10国临版2.0对照医保版2.0_0125.xlsx"),
         "ICD-9-CM-3编码": str(get_data_dir() / "ICD9国临版3.0对照医保版2.0_0125.xlsx"),
         "CCI合并症并发症": str(get_data_dir() / "CCI.xlsx"),
-        "疾病严重程度辅助目录": str(get_data_dir() / "中重度分型诊断.xlsx")
+        "疾病严重程度辅助目录": str(get_data_dir() / "中重度分型诊断.xlsx"),
+        "综合病种字典表": str(get_data_dir() / "综合病种字典表.xlsx")
     }
     
     try:

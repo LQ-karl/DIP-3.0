@@ -20,7 +20,7 @@ from ..core.auxiliary_directory import (
     CCICalculator, DiseaseSeverityClassifier, AgeFeatureClassifier, ICUStayClassifier
 )
 from ..utils.paths import get_data_dir, get_output_dir
-from ..core.national_directory_v30 import NationalDirectoryV30, NationalMatch, get_national_engine
+from ..core.national_directory_v30 import NationalDirectoryV30, NationalMatch, ZongheMatch, get_national_engine
 
 
 class LocalDirectoryGenerator:
@@ -176,6 +176,8 @@ class LocalDirectoryGenerator:
         self._nat_engine: Optional[NationalDirectoryV30] = None
         # seq(方案序号) -> NationalMatch：成组时登记，供 _build_group 回填国家目录元数据
         self._nat_seq_meta: Dict[str, NationalMatch] = {}
+        # 综合病种编码 -> ZongheMatch：未入核心病种者按官方综合病种字典兜底成组（2026-09-14）
+        self._zh_meta: Dict[str, "ZongheMatch"] = {}
         self._load_national_engine()
 
         # 不纳入分组：主要诊断剔除清单（命中即不参与分组测算）
@@ -900,9 +902,14 @@ class LocalDirectoryGenerator:
         用于本地目录库严格按 ①→②→③→④ 顺序成组与输出排序。
 
         ⚠️ 引擎唯一权威（用户 2026-09-04 裁决）：四层成组一律调用 NationalDirectoryV30
-        按 XQ/BX/FZ/JC 分段查表，命中者返回**方案序号**（全局唯一）作为成组键；
-        未命中（国家目录缺失该组合）一律落 ④ 基本规则键（诊断4位|主手术|相关手术），
-        不再使用旧《函》种子回落规则（PRI|/AUX|/OPMERGE 等旧键格式已随种子规则移除）。
+        按 XQ/BX/FZ/JC 分段查表，命中者返回**方案序号**（全局唯一）作为成组键。
+
+        ⚠️ 综合病种兜底（用户 2026-09-14 裁决「纳入并接入引擎兜底成组」）：
+        未入核心病种的病例（国家目录四层均未命中）不再落 ④ 基本规则键，
+        而是按《综合病种字典表》以「主诊断 ICD-10 类目 + 治疗方式组」入组综合病种
+        （DIP 2.0 技术规范 第四章第四节；治疗方式组由主要手术操作属性判定：
+         手术/介入→相关手术组，治疗性操作→治疗性操作组，诊断性操作→诊断性操作组，
+         其余→内科诊疗组）。综合病种字典缺失时保留原基本规则键兜底。
         """
         # ①②③④ 全部走《3.0 版分组方案》国家目录引擎（XQ/BX/FZ/JC 分段查表）
         if self._nat_engine is not None:
@@ -915,7 +922,17 @@ class LocalDirectoryGenerator:
                 self._nat_seq_meta[m.seq] = m
                 return m.seq, m.layer
 
-        # ---- 回落：引擎未加载 或 国家目录未命中该组合 → ④ 基本规则 ----
+            # ---- 回落①：未入核心病种 → 综合病种（官方兜底层） ----
+            zm = self._nat_engine.match_zonghe(
+                main_diag_code,
+                self._get_op_category(main_oprn_code),
+                bool(self._clean_str(main_oprn_code)),
+            )
+            if zm is not None:
+                self._zh_meta[zm.code] = zm
+                return zm.code, NationalDirectoryV30.LAYER_ZH
+
+        # ---- 回落②：引擎未加载 或 综合病种字典缺失 → ④ 基本规则键（末位兜底） ----
         diag_key = self._extract_icd4(main_diag_code)
         if main_oprn_code:
             if related_oprn_code:
@@ -982,7 +999,13 @@ class LocalDirectoryGenerator:
         综合病种(MIXED)名称按 DIP3.0 规范格式化为「类目名称 + 子组类型」
         （如「肺炎保守治疗组」「肺炎相关手术组」），便于目录库直观区分治疗方式。
         """
-        if group_type == GroupType.MIXED:
+        zh = getattr(self, '_zh_meta', {}).get(key)
+        if zh is not None:
+            # 综合病种（官方兜底层）：名称/编码一律以《综合病种字典表》为准
+            disease_name = zh.name
+            main_diag_name = zh.name
+            main_diag_code = stats.get('main_diag_code', '') or zh.icd_class
+        elif group_type == GroupType.MIXED:
             cat_name = (
                 stats.get('category_name')
                 or LocalDirectoryGenerator._clean_str(stats.get('main_diag_name'))
@@ -1041,6 +1064,11 @@ class LocalDirectoryGenerator:
         elif key in getattr(self, '_nat_dip_codes', set()):
             group.national_dip_code = key
             group.national_matched = True
+        # ③ 综合病种兜底层：回填官方综合病种编码（综合病种无方案序号）
+        if zh is not None:
+            group.national_dip_code = zh.code
+            group.national_matched = True
+            group.is_grassroot = False   # 基层病种是核心病种中的类别，综合病种一律不标记
         return group
 
     # ------------------------------------------------------------------
@@ -1108,6 +1136,8 @@ class LocalDirectoryGenerator:
         self.excluded_diag_records = []
         self.excluded_diag_cases = 0
         self._nat_seq_meta = {}
+        # 综合病种兜底元数据复位
+        self._zh_meta = {}
 
         # ---------- 第一阶段：核心病种初级聚类（四层顺序成组） ----------
         primary = defaultdict(lambda: {
@@ -1238,10 +1268,15 @@ class LocalDirectoryGenerator:
                 self.total_original_cases += case_count
                 self.total_trimmed_cases += trimmed
 
+                # 综合病种兜底层（未入核心病种）：分组类型标为综合病种，
+                # 不参与辅助分型/基层病种遴选（规范：二者均以核心病种为对象）。
+                _is_zh = stats['layer'] == NationalDirectoryV30.LAYER_ZH
                 group = self._build_group(
                     key=key, stats=stats, case_count=case_count, avg_cost=avg_cost,
                     kept_count=kept_count, lb=lb, ub=ub, trimmed=trimmed,
-                    group_type=GroupType.CORE, mixed_subtype="",
+                    group_type=(GroupType.MIXED if _is_zh else GroupType.CORE),
+                    mixed_subtype=(self._zh_meta[key].group_name
+                                   if _is_zh and key in self._zh_meta else ""),
                     records=stats['records'], layer=stats['layer'],
                 )
                 groups[key] = group
