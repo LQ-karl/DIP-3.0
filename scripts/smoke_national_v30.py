@@ -129,7 +129,7 @@ CASES = [
 
     # ---------------- 基层病种 ----------------
     ("基层 D24+85.2300x001", dict(main_diag="D24", main_oprn="85.2300x001"), None),
-    ("基层 D64.900 保守治疗组", dict(main_diag="D64.900", main_oprn=""), None),
+    ("基层 D64.900 内科诊疗组", dict(main_diag="D64.900", main_oprn=""), None),
 ]
 
 

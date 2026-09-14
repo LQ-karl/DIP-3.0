@@ -222,24 +222,30 @@ def test_extreme_case_trimming():
 
 
 def test_comprehensive_disease_subtypes():
-    """综合病种四子组：内科/诊断性/治疗性/相关手术组，op_category 正确，默认不剔除。
+    """综合病种四子组：内科诊疗组/诊断性/治疗性/相关手术组，op_category 正确，默认不剔除。
 
-    构造 5 个低频(各 3 例，低于阈值 10)病种，分属四种手术属性，验证：
+    构造 6 个低频(各 3 例，低于阈值 10)病种，分属四种手术属性，验证：
       1) 综合病种含全部四种子组（介入治疗并入相关手术组）；
       2) 各组的 手术操作类别(op_category) 与子组一致；
-      3) 默认 exclude_below_threshold=False 时，低频综合病种保留（不被质控剔除）。
+      3) 默认 exclude_below_threshold=False 时，低频综合病种保留（不被质控剔除）；
+      4) 官方《不纳入分组的主要手术操作》标「按保守治疗入组」的简单操作
+         （如 00.0100 治疗性超声）生效术式为空 → 内科诊疗组（用户裁决 2026-09-14）。
     """
     from src.models.models import GroupType
 
-    # 各子组的代表手术码（取自国临版3.0手术分类字典的「类别」列）
+    # 各子组的代表手术码（取自国临版3.0手术分类字典的「类别」列；均须避开
+    # 《不纳入分组的主要手术操作》中"按保守治疗入组"清单，以单独验证类别判定）
     rows = []
     specs = [
         # (诊断码, 诊断名, 手术码, 手术名, 期望子组, 期望类别)
-        ("A01.0", "测试内科病",   "",        "",            "保守治疗组",   ""),
-        ("B01.0", "测试诊断操作", "00.2100", "诊断性操作A", "诊断性操作组", "诊断性操作"),
-        ("C01.0", "测试治疗操作", "00.0100", "治疗性操作A", "治疗性操作组", "治疗性操作"),
-        ("D01.0", "测试手术",     "00.7000", "手术A",       "相关手术组",   "手术"),
-        ("E01.0", "测试介入",     "00.5500", "介入治疗A",   "相关手术组",   "介入治疗"),
+        ("A01.0", "测试内科病",   "",            "",             "内科诊疗组",   ""),
+        ("B01.0", "测试诊断操作", "00.2101",     "诊断性操作A",  "诊断性操作组", "诊断性操作"),
+        ("C01.0", "测试治疗操作", "00.0901",     "治疗性操作A",  "治疗性操作组", "治疗性操作"),
+        ("D01.0", "测试手术",     "00.7000x001", "手术A",        "相关手术组",   "手术"),
+        ("E01.0", "测试介入",     "00.5500x008", "介入治疗A",    "相关手术组",   "介入治疗"),
+        # 官方《不纳入分组的主要手术操作》标「按保守治疗入组」的简单操作：
+        # 其在手术分类表中虽属"治疗性操作"，但生效术式为空 → 内科诊疗组
+        ("F01.0", "测试简单操作", "00.0100",     "治疗性超声",   "内科诊疗组",   ""),
     ]
     for code, name, oprn, oprn_name, _sub, _cat in specs:
         for i in range(3):  # 每病 3 例，低于阈值 -> 进入综合病种
@@ -257,21 +263,24 @@ def test_comprehensive_disease_subtypes():
     groups = gen.cluster_records_to_groups(df)
 
     mixed = [g for g in groups.values() if g.group_type == GroupType.MIXED]
-    assert len(mixed) >= 4, f"综合病种数量应 >=4，实际 {len(mixed)}"
+    assert len(mixed) >= 5, f"综合病种数量应 >=5，实际 {len(mixed)}"
 
     subtypes = {g.mixed_subtype for g in mixed}
-    for expected in ("保守治疗组", "诊断性操作组", "治疗性操作组", "相关手术组"):
+    for expected in ("内科诊疗组", "诊断性操作组", "治疗性操作组", "相关手术组"):
         assert expected in subtypes, f"缺少综合病种子组: {expected}"
 
-    # 子组 <-> 类别 一致性校验
-    by_sub = {g.mixed_subtype: g for g in mixed}
-    assert by_sub["保守治疗组"].op_category == "", "保守治疗组 op_category 应为空"
-    assert by_sub["诊断性操作组"].op_category == "诊断性操作"
-    assert by_sub["治疗性操作组"].op_category == "治疗性操作"
+    # 子组 <-> 类别 一致性校验（按成组键精确定位，避免同子组多组相互覆盖）
+    assert groups["内科诊疗组|A01"].op_category == "", "内科诊疗组 op_category 应为空"
+    assert groups["诊断性操作组|B01"].op_category == "诊断性操作"
+    assert groups["治疗性操作组|C01"].op_category == "治疗性操作"
     # 手术 / 介入治疗 均并入相关手术组，类别分别为 手术 / 介入治疗
-    related = [g for g in mixed if g.mixed_subtype == "相关手术组"]
-    cats = {g.op_category for g in related}
-    assert "手术" in cats and "介入治疗" in cats, f"相关手术组应含手术与介入治疗类别，实际 {cats}"
+    assert groups["相关手术组|D01"].op_category == "手术"
+    assert groups["相关手术组|E01"].op_category == "介入治疗"
+    # 关键回归（用户裁决 2026-09-14）：官方《不纳入分组的主要手术操作》标注
+    # "按保守治疗入组"的简单操作，生效术式为空 → 内科诊疗组；
+    # 不得因其在手术分类表中类别是"治疗性操作"而误归治疗性操作组
+    assert groups["内科诊疗组|F01"].op_category == "", \
+        "按保守治疗入组的简单操作应落内科诊疗组"
 
     # 默认不剔除低频综合病种
     assert all(not g.excluded for g in mixed), "默认 exclude_below_threshold=False 不应剔除综合病种"
@@ -306,7 +315,7 @@ def test_zonghe_dictionary_engine_fallback():
     for cat in ("手术", "介入治疗"):
         m = engine.match_zonghe("A09.900", cat, True)
         assert m.code == "A09-4" and m.group_no == 4, f"{cat} 应并入相关手术组"
-    # 有主手术但类别未知（不在手术操作分类表）→ 保守治疗，落内科诊疗组
+    # 有主手术但类别未知（不在手术操作分类表）→ 内科诊疗组
     assert engine.match_zonghe("A09.900", "", True).code == "A09-1"
 
     # ③ 名称 / 组名称 / 命中类目取自字典
@@ -323,6 +332,36 @@ def test_zonghe_dictionary_engine_fallback():
     # ⑤ 非字典内类目 / 空主诊断 → 不匹配（调用方回落 ④ 基本规则键）
     assert engine.match_zonghe("QQQ.9", "", False) is None
     assert engine.match_zonghe("", "", False) is None
+
+
+def test_zonghe_engine_fallback_treats_simple_operation_as_conservative():
+    """综合病种兜底（成组键层）：官方标「按保守治疗入组」的简单操作 → 内科诊疗组。
+
+    用户裁决 2026-09-14：「医保结算清单中手术操作未填写是保守治疗；参考《不纳入
+    分组的主要手术操作》中的简单治疗，都纳入保守治疗」。
+
+    00.0100（头和颈部血管治疗性超声）在手术操作分类表中类别为"治疗性操作"，但
+    官方《五、不纳入分组的主要手术操作》明确标注「按保守治疗入组」，故其生效术式
+    为空 → 综合病种入组 A09-1（内科诊疗组），而非 A09-3（治疗性操作组）。
+    """
+    gen = LocalDirectoryGenerator(threshold=2)
+
+    # 简单操作（按保守治疗入组）→ 内科诊疗组
+    key, layer = gen._refine_core_group_key("A09.900", "00.0100", "")
+    assert key == "A09-1", f"按保守治疗入组的简单操作应入内科诊疗组(A09-1)，实际 {key}"
+    assert layer == "综合病种"
+
+    # 对照①：真正的治疗性操作（不在保守治疗清单）→ 治疗性操作组
+    key2, _ = gen._refine_core_group_key("A09.900", "00.0901", "")
+    assert key2 == "A09-3", f"治疗性操作应入治疗性操作组(A09-3)，实际 {key2}"
+
+    # 对照②：未填写手术操作 → 内科诊疗组
+    key3, _ = gen._refine_core_group_key("A09.900", "", "")
+    assert key3 == "A09-1", f"未填写手术操作应入内科诊疗组(A09-1)，实际 {key3}"
+
+    # 对照③：手术（不在保守治疗清单）→ 相关手术组
+    key4, _ = gen._refine_core_group_key("A09.900", "00.7000x001", "")
+    assert key4 == "A09-4", f"手术应入相关手术组(A09-4)，实际 {key4}"
 
 
 def test_resolve_category_name_prefers_icd10_map():
@@ -414,7 +453,7 @@ def test_core_disease_priority_and_merge():
     assert groups["I25-4"].national_matched is True
     assert groups["I25-4"].national_dip_code == "I25-4"
     # 正常体重新生儿(P59.9, 3200g) 不进先期 → JC-4513(P59.9-保守治疗-)
-    assert "JC-4513" in keys, "正常体重新生儿应走基本规则保守治疗组"
+    assert "JC-4513" in keys, "正常体重新生儿应走基本规则（无手术操作）"
 
     # ② 并项：D18.0 两规范术式 → 同组 BX-332（6例）
     assert groups["BX-332"].case_count == 6, \

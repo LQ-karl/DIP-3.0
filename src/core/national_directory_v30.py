@@ -265,7 +265,7 @@ class NationalDirectoryV30:
     #   主要操作 = 手术 / 介入操作      → 相关手术组(4)
     #   主要操作 = 治疗性操作            → 治疗性操作组(3)
     #   主要操作 = 诊断性操作            → 诊断性操作组(2)
-    #   无手术操作 / 均不能入组          → 内科诊疗组(1)
+    #   未包含手术及操作 / 仅简单操作      → 内科诊疗组(1)
     ZH_GROUP_BY_OP_CATEGORY = {
         "诊断性操作": 2,
         "治疗性操作": 3,
@@ -320,7 +320,7 @@ class NationalDirectoryV30:
 
         # ---- 基层病种 ----
         self.grassroot_pairs: Set[Tuple[str, str]] = set()   # (诊断键, 手术操作码)
-        self.grassroot_conservative: Set[str] = set()        # 仅保守治疗组的诊断键
+        self.grassroot_conservative: Set[str] = set()        # 仅内科诊疗组的诊断键
         try:
             df = self._read(self.SHEET_GRASSROOT)
             for _, r in df.iterrows():
@@ -858,7 +858,7 @@ class NationalDirectoryV30:
     def is_grassroot(self, diag_key: str, main_oprn: str) -> bool:
         """基层病种判定。
 
-        名单中「主要手术操作为空」= 仅保守治疗组（用户确认）：
+        名单中「主要手术操作为空」= 仅内科诊疗组（用户确认）：
         只有该诊断且无生效手术操作的病例才算；带手术操作的行按 (诊断, 术式) 匹配。
         """
         if not self.grassroot_pairs and not self.grassroot_conservative:

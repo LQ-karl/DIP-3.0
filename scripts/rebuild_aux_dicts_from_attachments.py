@@ -3,9 +3,17 @@
 
 产出：
   1) data/CCI.xlsx                <- 附件1 Charlson合并症指数CCI字典表（2292 条，医保版2.0编码）
-  2) data/中重度分型诊断.xlsx      <- 附件3 中度/重度 替换；保留原 转移/放疗/化疗
+  2) data/中重度分型诊断.xlsx      <- 附件3 原样纳入（中度1327 + 重度221 = 1548 条）
   3) data/综合病种字典表.xlsx      <- 附件4 原样纳入
 备份：output/_dict_backup_20260914/（output/ 已 gitignore，不污染仓库）
+
+裁决沿革（用户 2026-09-14）：
+  - 中重度：先"以附件替换中/重度、保留原转移/放疗/化疗"，后经复核确认附件3
+    仅含「重度诊断/中度诊断」两 sheet、不含转移/放疗/化疗，故改为
+    **全部删除 363 条、严格以附件3为准**。
+  - 「肿瘤转移并发」判定不依赖字典码集：规范（DIP3.0 技术规范）规定为
+    "次要诊断中含有恶性肿瘤的诊断且所属类目与主要诊断不同，住院天数3天以上"，
+    由 ICD-10 编码规则直接判定（C00-C96 ⊇ C77/C78/C79）。
 """
 import os
 import shutil
@@ -66,11 +74,8 @@ mod = pd.read_excel(A3, sheet_name="中度诊断", dtype=str, keep_default_na=Fa
 sev.columns = [str(c).strip() for c in sev.columns]
 mod.columns = [str(c).strip() for c in mod.columns]
 
-old = pd.read_excel(os.path.join(DATA, "中重度分型诊断.xlsx"), sheet_name="GX_ASSI",
-                    dtype=str, keep_default_na=False)
-old.columns = [str(c).strip() for c in old.columns]
-example = pd.read_excel(os.path.join(DATA, "中重度分型诊断.xlsx"), sheet_name="示例和说明",
-                        dtype=str, keep_default_na=False, header=None)
+old_example = pd.read_excel(os.path.join(DATA, "中重度分型诊断.xlsx"), sheet_name="示例和说明",
+                            dtype=str, keep_default_na=False, header=None)
 
 COLS = ["ID", "DIP_MAIN_CODE_TYPE", "DIP_MAIN_NAME_TYPE", "DIP_FX_TYPE", "DIP_FX_NAME_TYPE",
         "DIP_ASSISTANT_TYPE", "DIP_ASSISTANT_CODE", "DIP_ASSISTANT_NAME",
@@ -91,16 +96,12 @@ for code, name, src in [("1", "中度", mod), ("2", "重度", sev)]:
         })
 new_sev_n = len(rows)
 
-# 保留原文件的 转移(3) / 放疗(4) / 化疗(5) 行（不属于附件3 覆盖范围，引擎仍在使用转移）
-keep = old[old["DIP_ASSISTANT_CODE"].astype(str).str.strip().isin(["3", "4", "5"])].copy()
-keep = keep[COLS]
-kept_n = len(keep)
-L("中重度：新增 中/重度 =", new_sev_n, " 保留 转移/放疗/化疗 =", kept_n,
-  "（转移", int((keep['DIP_ASSISTANT_CODE'] == '3').sum()),
-  "放疗", int((keep['DIP_ASSISTANT_CODE'] == '4').sum()),
-  "化疗", int((keep['DIP_ASSISTANT_CODE'] == '5').sum()), "）")
+# 严格以附件3为准（用户裁决 2026-09-14）：不保留旧表的 转移(3)/放疗(4)/化疗(5) 共363条。
+# 附件3 仅含「重度诊断/中度诊断」两个 sheet；「肿瘤转移并发」按规范由 ICD-10
+# 编码规则判定（次要诊断含 C00-C96 且类目与主诊断不同 + 住院≥3天），不依赖该码集。
+L("中重度：中/重度 =", new_sev_n, "（严格以附件3为准，不再保留旧表转移/放疗/化疗）")
 
-gx = pd.concat([pd.DataFrame(rows, columns=COLS), keep], ignore_index=True)
+gx = pd.DataFrame(rows, columns=COLS)
 gx.insert(0, "序号", range(1, len(gx) + 1))
 # 恢复 schema：原表无「序号」列，用 ID 承载行号
 gx["ID"] = range(1, len(gx) + 1)
@@ -110,7 +111,7 @@ L("中重度 新 GX_ASSI 行数 =", len(gx))
 backup("中重度分型诊断.xlsx")
 with pd.ExcelWriter(os.path.join(DATA, "中重度分型诊断.xlsx"), engine="openpyxl") as w:
     gx.to_excel(w, sheet_name="GX_ASSI", index=False)
-    example.to_excel(w, sheet_name="示例和说明", index=False, header=False)
+    old_example.to_excel(w, sheet_name="示例和说明", index=False, header=False)
 L("[写出] data/中重度分型诊断.xlsx")
 
 # ==================================================================

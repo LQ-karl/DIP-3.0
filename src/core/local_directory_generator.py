@@ -20,7 +20,9 @@ from ..core.auxiliary_directory import (
     CCICalculator, DiseaseSeverityClassifier, AgeFeatureClassifier, ICUStayClassifier
 )
 from ..utils.paths import get_data_dir, get_output_dir
-from ..core.national_directory_v30 import NationalDirectoryV30, NationalMatch, ZongheMatch, get_national_engine
+from ..core.national_directory_v30 import (
+    NationalDirectoryV30, NationalMatch, ZongheMatch, CaseOps, get_national_engine,
+)
 
 
 class LocalDirectoryGenerator:
@@ -143,7 +145,7 @@ class LocalDirectoryGenerator:
 
         # ---- 基层病种（《DIP3.0 技术规范（征求意见稿）》第三章第四节）----
         # 基层病种是「核心病种中的一个类别」，由地方在本地数据中遴选：
-        #   候选池：《分组方案》基层病种 sheet 名录（诊断+手术对；手术空=仅保守治疗组）
+        #   候选池：《分组方案》基层病种 sheet 名录（诊断+手术对；手术空=仅内科诊疗组）
         #   校验项：① 属核心病种 ② 基层医疗机构病例占比 ≥ 阈值 ③ 组内 CV ≤ 阈值
         # 口径经用户 2026-09-04 确认：基层机构=一级及以下、占比≥50%、CV≤0.7。
         self.enable_grassroot = enable_grassroot
@@ -178,6 +180,9 @@ class LocalDirectoryGenerator:
         self._nat_seq_meta: Dict[str, NationalMatch] = {}
         # 综合病种编码 -> ZongheMatch：未入核心病种者按官方综合病种字典兜底成组（2026-09-14）
         self._zh_meta: Dict[str, "ZongheMatch"] = {}
+        # 成组键 -> CaseOps：成组时登记的「生效术式」（按《不纳入分组的主要手术操作》
+        # 清洗后的结果），供第二阶段综合病种子组判定复用（2026-09-14）
+        self._case_ops_meta: Dict[str, "CaseOps"] = {}
         self._load_national_engine()
 
         # 不纳入分组：主要诊断剔除清单（命中即不参与分组测算）
@@ -266,8 +271,12 @@ class LocalDirectoryGenerator:
 
     @staticmethod
     def _severity_priority(name: str) -> int:
-        """严重程度/辅助分型的优先级（数值越大越重）。"""
-        order = {"重度": 6, "中度": 5, "轻度": 4, "转移": 3, "放疗": 2, "化疗": 1}
+        """严重程度/辅助分型的优先级（数值越大越重）。
+
+        字典（data/中重度分型诊断.xlsx）严格以官方附件为准，仅含「中度/重度」；
+        「轻度」为规范中"不属于中重度"的兜底标签，保留以兼容既有口径。
+        """
+        order = {"重度": 6, "中度": 5, "轻度": 4}
         return order.get(name, 0)
 
     def _compute_group_cci(self, diag_codes: List[str], exclude_main: str = "") -> int:
@@ -781,19 +790,30 @@ class LocalDirectoryGenerator:
         return self._clinical_op_category.get(clinical, "")
 
     def _get_op_subtype(self, insurance_op_code: str) -> str:
-        """医保版手术码 -> 综合病种子组类型。介入治疗并入相关手术组。
+        """医保版手术码 -> 综合病种子组类型（四子组，见 DIP3.0 技术规范）。
 
-        四子组：保守治疗组（无手术操作/内科诊疗）/ 诊断性操作组 / 治疗性操作组 / 相关手术组。
+        组判定（规范「综合病种成组」）：
+          - 未包含手术及操作或仅包含简单操作 -> 内科诊疗组
+          - 主要操作属性 = 诊断性操作           -> 诊断性操作组
+          - 主要操作属性 = 治疗性操作           -> 治疗性操作组
+          - 主要操作属性 = 手术 / 介入操作       -> 相关手术组（介入并入相关手术组）
+
+        用户裁决（2026-09-14）：医保结算清单未填写手术操作 = 保守治疗；操作码
+        不属于手术操作分类表四类（手术/治疗性/诊断性/介入治疗）者视为「简单
+        治疗」，一并纳入内科诊疗组——对齐规范「按上述规则均不能入组的病例
+        归入内科诊疗组」。注意：此前的实现把该类误归相关手术组，已修正。
         """
         if not self._clean_str(insurance_op_code):
-            return "保守治疗组"
+            return "内科诊疗组"
         cat = self._get_op_category(insurance_op_code)
         if cat == "诊断性操作":
             return "诊断性操作组"
         if cat == "治疗性操作":
             return "治疗性操作组"
-        # 手术 / 介入治疗 / 未匹配到类别 -> 相关手术组
-        return "相关手术组"
+        if cat in ("手术", "介入治疗"):
+            return "相关手术组"
+        # 查不到类别 -> 简单治疗，归内科诊疗组
+        return "内科诊疗组"
 
     @staticmethod
     def _clean_str(value) -> str:
@@ -912,7 +932,21 @@ class LocalDirectoryGenerator:
          其余→内科诊疗组）。综合病种字典缺失时保留原基本规则键兜底。
         """
         # ①②③④ 全部走《3.0 版分组方案》国家目录引擎（XQ/BX/FZ/JC 分段查表）
+        case_ops = None
+        key = ""
+        layer = ""
         if self._nat_engine is not None:
+            # 先按《不纳入分组的主要手术操作》清洗术式（用户裁决 2026-09-14：
+            # 「未填写手术操作=保守治疗；参考不纳入主要手术操作的为简单治疗，
+            #   都纳入保守治疗」）：
+            #   ·「按保守治疗入组」  → 无生效术式（整条按保守治疗）
+            #   ·「不可作为主要手术操作」→ 顺延取下一个手术操作
+            #   ·「限范围可作主要手术操作」→ 主诊断在限定范围内方可作主手术
+            # 综合病种子组必须基于**生效术式**判定，否则被官方标注"按保守治疗
+            # 入组"的简单操作（如 00.0100 治疗性超声）会被误归治疗性操作组。
+            case_ops = self._nat_engine.clean_operations(
+                main_oprn_code, related_oprn_code, main_diag_code
+            )
             m = self._nat_engine.match(
                 main_diag_code, main_oprn_code, related_oprn_code, related_diag_code,
                 day_age=day_age, birth_weight=birth_weight, age=age,
@@ -920,25 +954,38 @@ class LocalDirectoryGenerator:
             )
             if m is not None:
                 self._nat_seq_meta[m.seq] = m
-                return m.seq, m.layer
+                key, layer = m.seq, m.layer
+            else:
+                # ---- 回落①：未入核心病种 → 综合病种（官方兜底层） ----
+                eff_oprn = case_ops.main_oprn if case_ops is not None else main_oprn_code
+                zm = self._nat_engine.match_zonghe(
+                    main_diag_code,
+                    self._get_op_category(eff_oprn),
+                    bool(self._clean_str(eff_oprn)),
+                )
+                if zm is not None:
+                    self._zh_meta[zm.code] = zm
+                    key, layer = zm.code, NationalDirectoryV30.LAYER_ZH
 
-            # ---- 回落①：未入核心病种 → 综合病种（官方兜底层） ----
-            zm = self._nat_engine.match_zonghe(
-                main_diag_code,
-                self._get_op_category(main_oprn_code),
-                bool(self._clean_str(main_oprn_code)),
-            )
-            if zm is not None:
-                self._zh_meta[zm.code] = zm
-                return zm.code, NationalDirectoryV30.LAYER_ZH
+        if not key:
+            # ---- 回落②：引擎未加载 或 综合病种字典缺失 → ④ 基本规则键（末位兜底） ----
+            diag_key = self._extract_icd4(main_diag_code)
+            if main_oprn_code:
+                if related_oprn_code:
+                    key = f"{diag_key}|{main_oprn_code}|{related_oprn_code}"
+                else:
+                    key = f"{diag_key}|{main_oprn_code}|"
+            else:
+                key = f"{diag_key}||"
+            layer = "基本规则"
 
-        # ---- 回落②：引擎未加载 或 综合病种字典缺失 → ④ 基本规则键（末位兜底） ----
-        diag_key = self._extract_icd4(main_diag_code)
-        if main_oprn_code:
-            if related_oprn_code:
-                return f"{diag_key}|{main_oprn_code}|{related_oprn_code}", "基本规则"
-            return f"{diag_key}|{main_oprn_code}|", "基本规则"
-        return f"{diag_key}||", "基本规则"
+        # 记录本组成组时的生效术式（供第二阶段综合病种子组判定复用；
+        # 避免"按保守治疗入组"的简单操作在本地聚类路径被误判）。
+        # setdefault：同一成组键可能由多条不同原始术式的记录命中（如 BX 名录的
+        # 「|」多选一），与第一阶段 stats 取首条记录的口径保持一致、结果确定。
+        if case_ops is not None:
+            self._case_ops_meta.setdefault(key, case_ops)
+        return key, layer
 
     # ======================================================================
     # ③ 诊断辅助细分（独立于第三步「触发式辅助分型」）
@@ -997,7 +1044,7 @@ class LocalDirectoryGenerator:
         """从聚合统计构造 DiseaseGroup（含 CCI / 严重度 / 裁剪 / 类别 / 成组层次 字段）。
 
         综合病种(MIXED)名称按 DIP3.0 规范格式化为「类目名称 + 子组类型」
-        （如「肺炎保守治疗组」「肺炎相关手术组」），便于目录库直观区分治疗方式。
+        （如「肺炎内科诊疗组」「肺炎相关手术组」），便于目录库直观区分治疗方式。
         """
         zh = getattr(self, '_zh_meta', {}).get(key)
         if zh is not None:
@@ -1112,7 +1159,7 @@ class LocalDirectoryGenerator:
              得到唯一核心成组键；组内病例数 >= 地方临界值(threshold) 的依次形成地方
              核心病种（与国家目录库对照、顺序一致）。
           二、综合病种：未达到核心病种临界值的病例，按手术操作属性分 4 子组
-             （保守治疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组），
+             （内科诊疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组），
              叠加主诊断 3 位码类目聚类，并做质量控制（剔除仍低于阈值者、
              标记组内变异系数过高的组）。
          三、各组住院总费用做极端病例裁剪（2.5% / 97.5% 分位数），
@@ -1138,6 +1185,8 @@ class LocalDirectoryGenerator:
         self._nat_seq_meta = {}
         # 综合病种兜底元数据复位
         self._zh_meta = {}
+        # 生效术式登记复位
+        self._case_ops_meta = {}
 
         # ---------- 第一阶段：核心病种初级聚类（四层顺序成组） ----------
         primary = defaultdict(lambda: {
@@ -1283,12 +1332,16 @@ class LocalDirectoryGenerator:
             else:
                 # 未达核心病种临界值 -> 进入综合病种池，第二阶段按手术属性 + 3 位码重聚类
                 # （此处不裁剪、不计入整体裁剪统计；裁剪在综合病种成型时统一进行）
+                # 子组判定用「生效术式」：被《不纳入分组的主要手术操作》标为
+                # 「按保守治疗入组」的简单操作，其生效术式为空 -> 内科诊疗组
+                _ops = self._case_ops_meta.get(key)
+                _eff_oprn = _ops.main_oprn if _ops is not None else stats['main_oprn_code']
                 for cost in stats['costs']:
                     subthreshold_records.append({
                         'main_diag': stats['main_diag_code'],
                         'main_diag_name': stats['main_diag_name'],
-                        'main_oprn': stats['main_oprn_code'],
-                        'main_oprn_name': stats['main_oprn_name'],
+                        'main_oprn': _eff_oprn,
+                        'main_oprn_name': stats['main_oprn_name'] if _eff_oprn else '',
                         'cost': cost,
                         'diag_codes': stats['diag_codes'],
                     })

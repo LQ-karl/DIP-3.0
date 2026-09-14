@@ -364,7 +364,7 @@ def _build_core_mixed(temp_groups: dict, threshold: int, records=None):
     综合病种(MIXED)，避免 1 例组各自成组（此前 Web 仅打标签却不折叠，导致阈值失效）。
 
     综合病种命名格式：类目名称 + 子组类型
-      （保守治疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组），
+      （内科诊疗组 / 诊断性操作组 / 治疗性操作组 / 相关手术组），
       与 LocalDirectoryGenerator 导出口径一致。
 
     返回 (core_groups, mixed_spec, code_to_mixed)：
@@ -581,7 +581,7 @@ def _calc_run_stage():
             core_groups, mixed_spec, _ = _build_core_mixed(temp_groups, threshold, records=records)
             # ===== 基层病种遴选（名录+本地校验，与 CLI 主流程 select_grassroot_groups 同口径）=====
             # ① 名录初判：命中《分组方案》基层病种 sheet 的核心组为候选（引擎按 诊断+手术 判定，
-            #    手术为空=仅保守治疗组）；② 成员重建：Web 批量成组不落 member_records，
+            #    手术为空=仅内科诊疗组）；② 成员重建：Web 批量成组不落 member_records，
             #    按国家 DIP 编码归集 hospital_level/total_cost（供基层占比与组内 CV 计算）；
             # ③ 统一走生成器 select_grassroot_groups：核心病种 + 基层占比≥50% + 组内 CV≤0.7。
             _members_by_code = {}

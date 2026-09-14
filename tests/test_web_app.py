@@ -176,7 +176,7 @@ def test_web_grassroot_selection_flow():
     grp = at.session_state["grouping_results"]
     assert len(grp) >= 1
     grass = [g for g in grp if getattr(g, "is_grassroot", False)]
-    assert grass, "A09.9 一级医院保守治疗组应被遴选为基层病种"
+    assert grass, "A09.9 一级医院内科诊疗组应被遴选为基层病种"
     assert all(g.main_diag_code.startswith("A09.9") for g in grass)
     # 该组病例数应为全部 18 例（基层占比 100%、CV≈0，三项校验全过）
     assert sum(g.case_count for g in grass) == 18

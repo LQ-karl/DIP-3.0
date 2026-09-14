@@ -228,8 +228,6 @@ class DiseaseSeverityClassifier:
         if path.exists():
             self._severe_codes = self._load_assi_codes(path, "2")
             self._organ_damage_codes = self._load_assi_codes(path, "1")
-            # 转移分型：DIP_ASSISTANT_CODE='3'（C77/C78/C79 继发性/远处转移部位，共288条）
-            self._metastasis_codes = self._load_assi_codes(path, "3")
         else:
             import warnings
             warnings.warn(
@@ -243,7 +241,6 @@ class DiseaseSeverityClassifier:
                 "K80", "K81", "K82", "K83", "K84", "K85", "K86", "K87", "N10",
                 "N11", "N12", "N13", "N14", "N15", "N16", "N17",
             }
-            self._metastasis_codes = {"C77", "C78", "C79"}
 
     @staticmethod
     def _death_level(record: MedicalRecord) -> str:
@@ -416,19 +413,21 @@ class DiseaseSeverityClassifier:
                    for c in self._split_diag_codes(diag_code))
 
     def _has_metastasis(self, diag_code: str, main_diag_code: str) -> bool:
-        """次要诊断（可含多码）是否含肿瘤转移/其他部位并发：
+        """次要诊断（可含多码）是否含肿瘤转移/其他部位并发。
 
-        - 命中中重度字典转移分型码集(code=3, C77/C78/C79 继发性/远处转移部位)，或
-        - 属于恶性肿瘤(C00-C96)且所属类目(前3位)与主要诊断不同（其他部位原发恶性肿瘤）；
-        且均与主要诊断类目不同。供恶性肿瘤严重程度『肿瘤转移并发』判定参考。
+        依据 DIP3.0 技术规范（恶性肿瘤疾病严重程度辅助分型第 4 类）：
+        「肿瘤有转移或其他部位并发的病例，次要诊断中含有恶性肿瘤的诊断
+        且所属类目与主要诊断不同，住院天数 3 天以上」。
+
+        即：次要诊断属恶性肿瘤（ICD-10 类目 C00-C96；转移性肿瘤 C77/C78/C79
+        本身即含于该区间）且类目（前三位）与主要诊断不同。不依赖字典码集
+        （住院天数≥3 天条件由调用方判定）。
         """
         main_prefix = (main_diag_code or "")[:3].upper()
         for c in self._split_diag_codes(diag_code):
             cp = c[:3].upper()
             if cp == main_prefix:
                 continue
-            if cp in self._metastasis_codes:
-                return True
             if "C00" <= cp <= "C96":
                 return True
         return False
