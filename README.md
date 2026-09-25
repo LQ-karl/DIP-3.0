@@ -104,5 +104,3 @@ pytest
 - 引擎冒烟测试：`python scripts/smoke_national_v30.py`
 
 ## 九、许可证
-
-内部测算工具，未声明开源许可证。
